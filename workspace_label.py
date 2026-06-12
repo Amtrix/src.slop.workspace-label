@@ -21,8 +21,8 @@ MENU_OPEN_CONFIG = 1001
 MENU_SHOW_OVERLAY = 1002
 MENU_EXIT = 1003
 
-# OLED Dimmed Color Palette
-COLOR_BG = "#000000"          # Pure black (OLED pixels completely turned off)
+# Overlay Color Palette
+COLOR_BG = "#010101"
 COLOR_TEXT_DIM = "#554422"    # Very dark, low-intensity amber (safe for OLED)
 COLOR_TEXT_ACTIVE = "#FFB300" # Muted gold for the active workspace highlight
 COLOR_ACTIVE_BG = "#221100"   # Extremely dark brown highlight box background
@@ -38,6 +38,10 @@ class WorkspaceOverlay:
         # Positioned top-left (X:20, Y:20). Size adjusts automatically to list length
         self.root.geometry("+20+20")
         self.root.configure(bg=COLOR_BG)
+        try:
+            self.root.attributes("-transparentcolor", COLOR_BG)
+        except tk.TclError:
+            pass
         self.root.attributes("-topmost", True)
 
         # Dictionary to keep track of UI label widgets
