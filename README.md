@@ -58,21 +58,37 @@ python .\workspace_label.py
 On first launch, the app creates a per-user config file at:
 
 ```powershell
-$env:LOCALAPPDATA\Desktop Labeller\desktops.txt
+$env:LOCALAPPDATA\Desktop Labeller\desktops.json
 ```
 
-Each line in that file becomes the label for the matching virtual desktop:
+The JSON config controls the displayed workspace names, text color, and overlay scale:
 
-```text
-Work
-Web
-Chat
-Media
+```json
+{
+  "names": [
+    "[1] first workspace",
+    "[2] second workspace",
+    "[3] third workspace",
+    "[4] fourth workspace",
+    "[5] fifth workspace",
+    "[6] sixth workspace",
+    "[7] seventh workspace"
+  ],
+  "font_rgba": [
+    135,
+    118,
+    84,
+    1.0
+  ],
+  "size_scale": 1.3
+}
 ```
 
-If you have more virtual desktops than labels, the app falls back to numbered labels such as `[5]`.
+![Desktop Labeller example overlay and JSON config](example.png)
 
-If an older local `desktops.txt` exists beside the script, the app copies it into the AppData config location the first time it creates the new config file.
+If you have more virtual desktops than names, the app falls back to numbered labels such as `[8]`. The `font_rgba` value uses red, green, blue, and alpha values. The `size_scale` value accepts `0.5` through `3.0`, where `1.0` is the default size.
+
+If an older local `desktops.txt` exists beside the script, the app copies those names into the AppData JSON config the first time it creates the new config file.
 
 Click the gear at the far left of the overlay to open the config file in your default text editor. Saved changes are picked up automatically while the overlay is running.
 
@@ -133,16 +149,18 @@ Run PowerShell as Administrator for these commands. Because Windows services run
 
 ## Customization
 
-- Edit `$env:LOCALAPPDATA\Desktop Labeller\desktops.txt` to rename the virtual desktop labels.
+- Edit `$env:LOCALAPPDATA\Desktop Labeller\desktops.json` to rename the virtual desktop labels.
 - Click the gear at the far left of the overlay to open the labels config directly.
-- Edit the color constants in `workspace_label.py` to change the overlay palette.
+- Change `font_rgba` in the JSON config to set the label text color.
+- Change `size_scale` in the JSON config to resize the overlay.
 - Change the `root.geometry("+20+20")` value in `workspace_label.py` to move the overlay.
 - Change `lbl.pack(side="left", padx=2)` to `side="top"` in `workspace_label.py` if you prefer a vertical list.
 
 ## Troubleshooting
 
 - If the overlay does not appear, confirm that the process is running and that Windows virtual desktops are available.
-- If labels are missing, check `$env:LOCALAPPDATA\Desktop Labeller\desktops.txt` and restart the app.
+- If labels are missing, check `$env:LOCALAPPDATA\Desktop Labeller\desktops.json` and restart the app.
+- If the overlay shows `JSON: Bad format`, fix the JSON syntax in the config file and save it.
 - If desktop switching does not work, reinstall `pyvda` and make sure the app is running on Windows.
 - If controller commands fail to find the executable, rebuild with PyInstaller or place `workspace_label.exe` beside `controller.ps1`.
 - If installer creation fails with `ISCC.exe was not found`, install Inno Setup 6 or add its install folder to your `PATH`.
