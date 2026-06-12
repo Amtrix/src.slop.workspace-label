@@ -15,6 +15,7 @@ ENV/
 
 # Runtime/user config
 desktops.txt
+desktops.json
 
 # PyInstaller output
 build/
