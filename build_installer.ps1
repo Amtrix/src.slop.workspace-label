@@ -50,7 +50,7 @@ function Invoke-PyInstallerBuild {
 
     $pyInstaller = Get-Command "pyinstaller" -ErrorAction SilentlyContinue
     if ($pyInstaller) {
-        & $pyInstaller.Source $SpecPath
+        & $pyInstaller.Source "--noconfirm" $SpecPath
         if ($LASTEXITCODE -eq 0) {
             return
         }
@@ -59,7 +59,7 @@ function Invoke-PyInstallerBuild {
     $pythonCommands = @()
     $pyLauncher = Get-Command "py" -ErrorAction SilentlyContinue
     if ($pyLauncher) {
-        $pythonCommands += @{ Exe = $pyLauncher.Source; Args = @("-m", "PyInstaller", $SpecPath) }
+        $pythonCommands += @{ Exe = $pyLauncher.Source; Args = @("-m", "PyInstaller", "--noconfirm", $SpecPath) }
     }
 
     $pyLauncherPaths = @(
@@ -69,20 +69,20 @@ function Invoke-PyInstallerBuild {
 
     foreach ($pyLauncherPath in $pyLauncherPaths) {
         if (Test-Path $pyLauncherPath) {
-            $pythonCommands += @{ Exe = $pyLauncherPath; Args = @("-m", "PyInstaller", $SpecPath) }
+            $pythonCommands += @{ Exe = $pyLauncherPath; Args = @("-m", "PyInstaller", "--noconfirm", $SpecPath) }
         }
     }
 
     $pythonInstallRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
     if (Test-Path $pythonInstallRoot) {
         Get-ChildItem $pythonInstallRoot -Directory -Filter "Python*" |
-            Sort-Object Name -Descending |
-            ForEach-Object {
-                $pythonExe = Join-Path $_.FullName "python.exe"
-                if (Test-Path $pythonExe) {
-                    $pythonCommands += @{ Exe = $pythonExe; Args = @("-m", "PyInstaller", $SpecPath) }
-                }
+        Sort-Object Name -Descending |
+        ForEach-Object {
+            $pythonExe = Join-Path $_.FullName "python.exe"
+            if (Test-Path $pythonExe) {
+                $pythonCommands += @{ Exe = $pythonExe; Args = @("-m", "PyInstaller", "--noconfirm", $SpecPath) }
             }
+        }
     }
 
     foreach ($pythonCommand in $pythonCommands) {
@@ -98,6 +98,14 @@ function Invoke-PyInstallerBuild {
 Push-Location $ProjectDir
 try {
     if (-not $SkipPyInstaller) {
+        # Stop any running instance so PyInstaller can replace the locked bundle (e.g. pywintypes313.dll).
+        $running = Get-Process "workspace_label" -ErrorAction SilentlyContinue
+        if ($running) {
+            Write-Host "[*] Stopping running Desktop Labeller instance..." -ForegroundColor Yellow
+            $running | Stop-Process -Force
+            Start-Sleep -Milliseconds 500
+        }
+
         Write-Host "[*] Building PyInstaller bundle..." -ForegroundColor Cyan
         Invoke-PyInstallerBuild -SpecPath $SpecPath
     }

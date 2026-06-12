@@ -61,7 +61,7 @@ On first launch, the app creates a per-user config file at:
 $env:LOCALAPPDATA\Desktop Labeller\desktops.json
 ```
 
-The JSON config controls the displayed workspace names, text color, and overlay scale:
+The JSON config controls the displayed workspace names, text color, label surface color, and overlay scale:
 
 ```json
 {
@@ -80,13 +80,19 @@ The JSON config controls the displayed workspace names, text color, and overlay 
     84,
     1.0
   ],
+  "surface_rgba": [
+    2,
+    2,
+    2,
+    1.0
+  ],
   "size_scale": 1.3
 }
 ```
 
 ![Desktop Labeller example overlay and JSON config](example.png)
 
-If you have more virtual desktops than names, the app falls back to numbered labels such as `[8]`. The `font_rgba` value uses red, green, blue, and alpha values. The `size_scale` value accepts `0.5` through `3.0`, where `1.0` is the default size.
+If you have more virtual desktops than names, the app falls back to numbered labels such as `[8]`. The `font_rgba` value uses red, green, blue, and alpha values. The `surface_rgba` value (same red, green, blue, alpha format) sets the clickable background painted behind each label; it defaults to a near-black `[2, 2, 2, 1.0]` so the whole padded label area is clickable while staying nearly invisible. The `size_scale` value accepts `0.5` through `3.0`, where `1.0` is the default size.
 
 If an older local `desktops.txt` exists beside the script, the app copies those names into the AppData JSON config the first time it creates the new config file.
 
@@ -152,6 +158,7 @@ Run PowerShell as Administrator for these commands. Because Windows services run
 - Edit `$env:LOCALAPPDATA\Desktop Labeller\desktops.json` to rename the virtual desktop labels.
 - Click the gear at the far left of the overlay to open the labels config directly.
 - Change `font_rgba` in the JSON config to set the label text color.
+- Change `surface_rgba` in the JSON config to set the clickable background behind each label.
 - Change `size_scale` in the JSON config to resize the overlay.
 - Change the `root.geometry("+20+20")` value in `workspace_label.py` to move the overlay.
 - Change `lbl.pack(side="left", padx=2)` to `side="top"` in `workspace_label.py` if you prefer a vertical list.

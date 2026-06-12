@@ -5,7 +5,7 @@ a = Analysis(
     ['workspace_label.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('desktop_labeller.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -32,6 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='desktop_labeller.ico',
 )
 coll = COLLECT(
     exe,

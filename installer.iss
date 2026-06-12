@@ -17,6 +17,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
+SetupIconFile=desktop_labeller.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Tasks]
@@ -30,7 +31,7 @@ Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Desktop Labeller"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
-Name: "{group}\Stop Desktop Labeller"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\controller.ps1"" -Stop"; WorkingDir: "{app}"
+Name: "{group}\Stop Desktop Labeller"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\controller.ps1"" -Stop"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall Desktop Labeller"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Desktop Labeller"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{userstartup}\Desktop Labeller"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: autostart
