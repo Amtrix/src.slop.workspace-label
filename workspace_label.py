@@ -83,6 +83,9 @@ class OverlayPanel:
         self.move_label = DEFAULT_MOVE_WINDOW_LABEL
         self.label_widgets = {}
         self.label_base_text = {}
+        # Per-desktop-index text color override (1-based idx -> hex), empty
+        # when every label uses the panel's default font color.
+        self.name_colors = {}
         self.marked_desktops = set()
         self.move_button = None
         self.pin_button = None
@@ -410,6 +413,7 @@ class WorkspaceOverlay:
         return {
             "bad_format": True,
             "names": [],
+            "name_colors": [],
             "font_color": COLOR_BAD_CONFIG,
             "surface_color": COLOR_HIT_BG,
             "size_scale": DEFAULT_SIZE_SCALE,
@@ -422,16 +426,39 @@ class WorkspaceOverlay:
             if not isinstance(config, dict):
                 raise ValueError()
 
-            names = config.get("names")
-            if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            names_raw = config.get("names")
+            if not isinstance(names_raw, list):
                 raise ValueError()
+            # Each entry is either a plain string, or an object
+            # {"name": "...", "font_rgba"/"color": <rgba list or hex>} that
+            # overrides the per-label text color.
+            names = []
+            name_colors = []
+            for entry in names_raw:
+                if isinstance(entry, str):
+                    names.append(entry.strip())
+                    name_colors.append(None)
+                elif isinstance(entry, dict):
+                    name = entry.get("name", "")
+                    if not isinstance(name, str):
+                        raise ValueError()
+                    names.append(name.strip())
+                    raw_color = entry.get("font_rgba", entry.get("color"))
+                    name_colors.append(
+                        self.parse_border_color(raw_color)
+                        if raw_color is not None
+                        else None
+                    )
+                else:
+                    raise ValueError()
 
             font_rgba = config.get("font_rgba", DEFAULT_FONT_RGBA)
             surface_rgba = config.get("surface_rgba", DEFAULT_SURFACE_RGBA)
             size_scale = self.parse_size_scale(config.get("size_scale", DEFAULT_SIZE_SCALE))
             return {
                 "bad_format": False,
-                "names": [name.strip() for name in names],
+                "names": names,
+                "name_colors": name_colors,
                 "font_color": self.rgba_to_hex(font_rgba),
                 "surface_color": self.rgba_to_hex(surface_rgba),
                 "size_scale": size_scale,
@@ -529,12 +556,19 @@ class WorkspaceOverlay:
                     icon = item.get("opt_icon")
                     if not isinstance(icon, str) or not icon.strip():
                         icon = None
+                    raw_color = item.get("font_rgba", item.get("color"))
+                    color = (
+                        self.parse_border_color(raw_color)
+                        if raw_color is not None
+                        else None
+                    )
                     entries.append(
                         {
                             "label": label,
                             "path": path,
                             "arguments": arguments,
                             "icon": icon,
+                            "color": color,
                         }
                     )
 
@@ -683,6 +717,7 @@ class WorkspaceOverlay:
             widget.destroy()
         panel.label_widgets.clear()
         panel.label_base_text.clear()
+        panel.name_colors = {}
         panel.marked_desktops = set()
         panel.move_button = None
         panel.pin_button = None
@@ -723,6 +758,14 @@ class WorkspaceOverlay:
 
         workspace_maps = self.get_all_labels(config["names"], total_desktops)
 
+        # Map any per-label color overrides onto their 1-based desktop index.
+        config_colors = config.get("name_colors", [])
+        panel.name_colors = {
+            idx: config_colors[idx - 1]
+            for idx in workspace_maps
+            if idx - 1 < len(config_colors) and config_colors[idx - 1]
+        }
+
         # Grid/Pack them horizontally (change to side="top" if you prefer vertical stack)
         for idx, text in workspace_maps.items():
             lbl = tk.Label(
@@ -730,7 +773,7 @@ class WorkspaceOverlay:
                 text=text,
                 font=("Consolas", self.scaled_size(11), "bold"),
                 bg=self.workspace_surface_color,
-                fg=self.workspace_font_color,
+                fg=panel.name_colors.get(idx, self.workspace_font_color),
                 padx=self.scaled_size(10),
                 pady=self.scaled_size(6),
                 cursor="hand2" # Changes mouse cursor to hand pointer on hover
@@ -898,11 +941,13 @@ class WorkspaceOverlay:
                 pady=self.scaled_size(2),
             )
 
+            entry_color = entry.get("color") or self.workspace_font_color
+
             image = self.load_shortcut_icon(panel, entry["icon"])
             icon_lbl = tk.Label(
                 item,
                 bg=COLOR_HIT_BG,
-                fg=self.workspace_font_color,
+                fg=entry_color,
                 padx=self.scaled_size(4),
                 pady=self.scaled_size(4),
                 cursor="hand2",
@@ -921,7 +966,7 @@ class WorkspaceOverlay:
                 text=f" {entry['label']} ",
                 font=("Segoe UI", self.scaled_size(11), "bold"),
                 bg=COLOR_HIT_BG,
-                fg=self.workspace_font_color,
+                fg=entry_color,
                 padx=self.scaled_size(4),
                 pady=self.scaled_size(4),
                 cursor="hand2",
@@ -1330,7 +1375,7 @@ class WorkspaceOverlay:
             fg = panel.notification_settings["color"]
             text = f" {base.strip()} {panel.notification_settings['indicator']} "
         else:
-            fg = panel.font_color
+            fg = panel.name_colors.get(idx) or panel.font_color
             text = base
         lbl.config(fg=fg, bg=bg, text=text)
 

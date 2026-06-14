@@ -94,6 +94,25 @@ The JSON config controls the displayed workspace names, text color, label surfac
 
 If you have more virtual desktops than names, the app falls back to numbered labels such as `[8]`. The `font_rgba` value uses red, green, blue, and alpha values. The `surface_rgba` value (same red, green, blue, alpha format) sets the clickable background painted behind each label; it defaults to a near-black `[2, 2, 2, 1.0]` so the whole padded label area is clickable while staying nearly invisible. The `size_scale` value accepts `0.5` through `3.0`, where `1.0` is the default size.
 
+### Per-label colors
+
+By default every workspace name uses the shared `font_rgba` text color. To give an individual label its own color, replace that string in `"names"` with an object that carries a `name` plus a color. The color can be a hex string (`"color"`) or an RGBA list (`"font_rgba"`, same format as the top-level value). Plain strings and colored objects can be mixed freely:
+
+```json
+{
+  "names": [
+    "[1] first workspace",
+    { "name": "[2] alerts", "color": "#FF3333" },
+    { "name": "[3] media", "font_rgba": [0, 200, 255, 1.0] },
+    "[4] fourth workspace"
+  ],
+  "font_rgba": [135, 118, 84, 1.0]
+}
+```
+
+Labels without an explicit color keep the shared `font_rgba`. The per-label color only affects the idle text; the active-desktop highlight and notification color still take precedence when those states apply.
+
+
 The config file is parsed as JSONC, so you can add `//` line comments to annotate your settings.
 
 #### Choosing which monitors to use
@@ -164,6 +183,7 @@ A toolbar can appear underneath the workspace list, populated by optional featur
   - `path` — the program or file to open (required). Environment variables such as `%LOCALAPPDATA%` are expanded.
   - `arguments` — optional command-line arguments passed when launching.
   - `opt_icon` — optional path to a `PNG`/`GIF` icon. If omitted or it fails to load, a placeholder glyph is shown instead.
+  - `color` (or `font_rgba`) — optional per-shortcut text/icon color, as a hex string such as `"#3399FF"` or an RGBA list (same format as the top-level `font_rgba`). Omit it to use the shared label color.
 
 It also accepts two optional border properties that, when both are set, draw a border around the whole shortcut grid:
 
