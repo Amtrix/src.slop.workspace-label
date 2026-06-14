@@ -98,17 +98,40 @@ The config file is parsed as JSONC, so you can add `//` line comments to annotat
 
 #### Choosing which monitors to use
 
-By default the overlay is rendered on **every** monitor. Add an optional `desktops` array to limit it to specific monitors:
+By default the overlay is rendered on **every** monitor, using the single config object at the top level (this is the "flat" form shown above).
+
+To render **different** configs on **different** monitors, replace the flat object with one or more `desktop:` keyed blocks. Each key names the 1-based monitor indices it applies to, and its value is a full config object (names, colors, scale, and any `opt_feature_*` features):
 
 ```jsonc
 {
-  "names": ["Work", "Web", "Chat", "Media"],
-  // Render the overlay only on the first and third monitors.
-  "desktops": [1, 3]
+  // Big labels with shortcuts on the first and third monitors.
+  "desktop:1,3": {
+    "names": ["Work", "Web", "Chat", "Media"],
+    "size_scale": 1.5,
+    "opt_component_feature_shortcuts": {
+      "entries": [{ "label": "Notepad", "path": "notepad.exe" }]
+    }
+  },
+  // A smaller, plainer overlay on the second monitor.
+  "desktop:2": {
+    "names": ["Work", "Web", "Chat", "Media"],
+    "size_scale": 1.0
+  }
 }
 ```
 
-`desktops` is an array of 1-based monitor indices. Index `1` is the left-most monitor; monitors are ordered left-to-right, then top-to-bottom (matching how Windows Display Settings arranges them). Any index outside the available range is ignored, and if none of the listed indices are valid the overlay falls back to rendering on all monitors. The overlay automatically rebuilds itself when a monitor is plugged in or unplugged.
+Rules for `desktop:` blocks:
+
+- Indices are **1-based**. Index `1` is the left-most monitor; monitors are ordered left-to-right, then top-to-bottom (matching how Windows Display Settings arranges them).
+- A single key can list several monitors, e.g. `"desktop:1,2,3"`.
+- A bare `"desktop"` key (or `"desktop:"` with no indices) means **all monitors**. This is handy for a default block: pair it with more specific keys to override individual monitors, e.g. `"desktop"` for everything plus `"desktop:2"` for one different monitor.
+- You may declare as many `desktop:` keys as you like, each with its own independent config (different names, colors, scale, and features per monitor).
+- Only the monitors named by a `desktop:` key get an overlay; unlisted monitors stay clear.
+- If the **same** index appears in more than one key, the block that comes **later** in the file wins.
+- Any index outside the available range is ignored. If none of the listed indices match a connected monitor, the first defined block is shown on the primary monitor so the overlay (and its config gear) stays reachable.
+- If there are **no** `desktop:` keys at all, the whole object is treated as one flat config rendered on every monitor (backward compatible).
+- The overlay automatically rebuilds itself when a monitor is plugged in or unplugged.
+
 
 #### Optional toolbar features
 
@@ -118,22 +141,22 @@ A toolbar can appear underneath the workspace list, populated by optional featur
 {
   "names": ["Work", "Web", "Chat", "Media"],
   // Adds a button that moves the focused window to the next workspace you click.
-  "opt_feature_movewindow": {
+  "opt_toolbar_feature_movewindow": {
     "label": "Move Window"
   },
   // Adds a button that pins/unpins the focused window across all workspaces.
-  "opt_feature_pinwindow": {
+  "opt_toolbar_feature_pinwindow": {
     "label_pin": "Pin Window",
     "label_unpin": "Unpin Window"
   }
 }
 ```
 
-`opt_feature_movewindow` adds a button to the toolbar. Click it to arm move mode, then click a workspace label to move the currently focused window to that virtual desktop. Its `label` property sets the button text and defaults to `Move Window`.
+`opt_toolbar_feature_movewindow` adds a button to the toolbar. Click it to arm move mode, then click a workspace label to move the currently focused window to that virtual desktop. Its `label` property sets the button text and defaults to `Move Window`.
 
-`opt_feature_pinwindow` adds a button that pins or unpins the currently focused window so it stays visible across every virtual desktop. The button automatically reflects the focused window's current state: it shows `label_pin` (default `Pin Window`) when the window is not pinned and `label_unpin` (default `Unpin Window`) when it is. Clicking the button flips that state for the focused window.
+`opt_toolbar_feature_pinwindow` adds a button that pins or unpins the currently focused window so it stays visible across every virtual desktop. The button automatically reflects the focused window's current state: it shows `label_pin` (default `Pin Window`) when the window is not pinned and `label_unpin` (default `Unpin Window`) when it is. Clicking the button flips that state for the focused window.
 
-`opt_feature_shortcuts` adds a grid of clickable shortcuts that launch programs or files. It takes two properties:
+`opt_component_feature_shortcuts` adds a grid of clickable shortcuts that launch programs or files. It takes two properties:
 
 - `column_count` (integer `>= 1`) — how many columns to split the shortcut list across. Entries fill left-to-right, top-to-bottom.
 - `entries` — a list of shortcut objects. Each entry supports:
@@ -150,7 +173,7 @@ It also accepts two optional border properties that, when both are set, draw a b
 ```jsonc
 {
   "names": ["Work", "Web", "Chat", "Media"],
-  "opt_feature_shortcuts": {
+  "opt_component_feature_shortcuts": {
     "column_count": 2,
     "border_width": 1,
     "border_color": "#554422",
@@ -167,7 +190,7 @@ It also accepts two optional border properties that, when both are set, draw a b
 }
 ```
 
-`opt_feature_notifications` marks a workspace label when one of its windows requests attention (the same signal that flashes a taskbar button — for example a Teams/Slack/Discord ping or a dialog needing input). The mark appears on the corresponding label across every monitor the overlay renders on, so you can see at a glance which workspace wants you. It takes two optional properties:
+`opt_feature_notifications` marks a workspace label when one of its windows requests attention (the same signal that flashes a taskbar button — for example a Teams/Slack/Discord ping or a dialog needing input). The mark appears on the corresponding label on every monitor whose config enables this feature, so you can see at a glance which workspace wants you. It takes two optional properties:
 
 - `indicator` — the glyph appended to a flagged workspace label (defaults to `●`).
 - `color` — the indicator/label color while flagged, as a hex string such as `"#FF3333"` or an RGBA list (same format as `font_rgba`).

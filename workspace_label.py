@@ -65,6 +65,17 @@ class OverlayPanel:
     def __init__(self, win, monitor_rect):
         self.win = win
         self.monitor_rect = monitor_rect  # (left, top, right, bottom)
+        # Full normalized config rendered on this monitor (set before build).
+        self.config = None
+        self.font_color = COLOR_TEXT_DIM
+        self.surface_color = COLOR_HIT_BG
+        self.size_scale = DEFAULT_SIZE_SCALE
+        self.features = {}
+        self.notification_settings = None
+        self.pin_labels = {
+            "label_pin": DEFAULT_PIN_WINDOW_LABEL,
+            "label_unpin": DEFAULT_UNPIN_WINDOW_LABEL,
+        }
         self.label_widgets = {}
         self.label_base_text = {}
         self.marked_desktops = set()
@@ -99,8 +110,6 @@ class WorkspaceOverlay:
 
         # Optional "move window" toolbar feature state (global across monitors).
         self.move_mode = False
-        # Optional "pin window" toolbar feature labels.
-        self.pin_labels = {"label_pin": DEFAULT_PIN_WINDOW_LABEL, "label_unpin": DEFAULT_UNPIN_WINDOW_LABEL}
         # Last external (non-overlay) foreground window; the pin/move actions
         # and the pin button's displayed state both track this window.
         self.tracked_hwnd = None
@@ -108,8 +117,9 @@ class WorkspaceOverlay:
         # Last foreground window seen while pinned to background; used to avoid
         # re-issuing SetWindowPos (and its recomposite/jitter) every tick.
         self.last_foreground_hwnd = None
-        # Optional per-workspace notification feature state.
-        self.notification_settings = None
+        # Per-workspace notification feature state. Enabled if ANY rendered
+        # config turns it on; the indicator/colour itself is per panel.
+        self.notifications_enabled = False
         self.notified_desktops = set()
         self.last_active_desktop = None
         self.wm_shellhook = None
@@ -197,24 +207,85 @@ class WorkspaceOverlay:
         rects.sort(key=lambda r: (r[0], r[1]))
         return rects
 
-    def parse_desktops(self, config):
-        """Parses the optional `desktops` monitor-index list (1-based)."""
-        value = config.get("desktops")
-        if not isinstance(value, list):
+    def parse_desktop_key(self, key):
+        """Parses a ``desktop`` scope key into a render target.
+
+        Returns:
+          * ``"all"`` for a bare ``desktop`` (or ``desktop:`` with no valid
+            indices), meaning render on every monitor.
+          * a list of 1-based indices for ``desktop:1,2,3``.
+          * ``None`` when the key is not a ``desktop`` scope key at all.
+        """
+        if not isinstance(key, str) or key.split(":", 1)[0] != "desktop":
             return None
-        indices = [v for v in value if isinstance(v, int) and not isinstance(v, bool)]
-        return indices or None
+        if ":" not in key:
+            return "all"
+        indices = []
+        for part in key.split(":", 1)[1].split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(part)
+            except ValueError:
+                continue
+            if value >= 1:
+                indices.append(value)
+        return indices or "all"
 
-    def target_monitor_rects(self, desktops):
-        """Resolves which monitor rectangles to render on (all, or a subset)."""
+    def resolve_render_targets(self):
+        """Returns an ordered list of ``(monitor_rect, config)`` to render.
+
+        Two config layouts are supported:
+          * Flat: the whole object is one config rendered on every monitor.
+          * Scoped: any top-level ``desktop:i,j`` key maps a full config onto
+            the given 1-based monitor indices, and only listed monitors render.
+            When the same index appears in several keys, the later key wins.
+        """
+        self.ensure_config_exists()
         rects = self.get_monitor_rects()
-        if not desktops:
-            return rects
-        chosen = [rects[i - 1] for i in desktops if 1 <= i <= len(rects)]
-        return chosen or rects
+        primary = rects[0]
 
-    def sync_panels(self, rects):
-        """(Re)creates per-monitor windows so they match the target rects."""
+        try:
+            raw = CONFIG_FILE.read_text(encoding="utf-8")
+            top = json.loads(self.strip_jsonc_comments(raw))
+            if not isinstance(top, dict):
+                raise ValueError()
+        except Exception:
+            return [(primary, self.bad_config())]
+
+        scoped = {}  # 1-based monitor index -> parsed config
+        has_scoped_key = False
+        for key, value in top.items():
+            indices = self.parse_desktop_key(key)
+            if indices is None:
+                continue
+            has_scoped_key = True
+            parsed = self.parse_single_config(value)
+            target_indices = range(1, len(rects) + 1) if indices == "all" else indices
+            for index in target_indices:
+                scoped[index] = parsed
+
+        if not has_scoped_key:
+            # Flat config: render the same thing on every monitor.
+            config = self.parse_single_config(top)
+            return [(rect, config) for rect in rects]
+
+        targets = [
+            (rects[index - 1], scoped[index])
+            for index in sorted(scoped)
+            if 1 <= index <= len(rects)
+        ]
+        if not targets:
+            # Scoped keys present but none map to a connected monitor; show the
+            # first defined block on the primary monitor so the overlay (and its
+            # config gear) stays reachable.
+            first = scoped[sorted(scoped)[0]]
+            return [(primary, first)]
+        return targets
+
+    def sync_panels(self, targets):
+        """(Re)creates per-monitor windows to match the ``(rect, config)`` targets."""
         # Tear down any extra windows beyond the primary.
         for panel in self.panels[1:]:
             try:
@@ -224,17 +295,21 @@ class WorkspaceOverlay:
         self.panels = self.panels[:1]
 
         # Primary panel reuses self.root.
+        rect0, config0 = targets[0]
         self.style_window(self.root)
-        self.panels[0].monitor_rect = rects[0]
+        self.panels[0].monitor_rect = rect0
+        self.panels[0].config = config0
         self.panels[0].hwnd = None
-        self.position_window(self.root, rects[0])
+        self.position_window(self.root, rect0)
 
         # Secondary monitors get their own Toplevel windows.
-        for rect in rects[1:]:
+        for rect, config in targets[1:]:
             win = tk.Toplevel(self.root)
             self.style_window(win)
             self.position_window(win, rect)
-            self.panels.append(OverlayPanel(win, rect))
+            panel = OverlayPanel(win, rect)
+            panel.config = config
+            self.panels.append(panel)
 
         self.raw_monitor_signature = tuple(self.get_monitor_rects())
 
@@ -320,12 +395,20 @@ class WorkspaceOverlay:
         except Exception:
             return 4
 
-    def get_workspace_config(self):
-        self.ensure_config_exists()
+    def bad_config(self):
+        """Normalized config used when an object fails to parse."""
+        return {
+            "bad_format": True,
+            "names": [],
+            "font_color": COLOR_BAD_CONFIG,
+            "surface_color": COLOR_HIT_BG,
+            "size_scale": DEFAULT_SIZE_SCALE,
+            "features": {},
+        }
 
+    def parse_single_config(self, config):
+        """Validates one config object into the normalized render dict."""
         try:
-            raw = CONFIG_FILE.read_text(encoding="utf-8")
-            config = json.loads(self.strip_jsonc_comments(raw))
             if not isinstance(config, dict):
                 raise ValueError()
 
@@ -343,18 +426,9 @@ class WorkspaceOverlay:
                 "surface_color": self.rgba_to_hex(surface_rgba),
                 "size_scale": size_scale,
                 "features": self.parse_optional_features(config),
-                "desktops": self.parse_desktops(config),
             }
         except Exception:
-            return {
-                "bad_format": True,
-                "names": [],
-                "font_color": COLOR_BAD_CONFIG,
-                "surface_color": COLOR_HIT_BG,
-                "size_scale": DEFAULT_SIZE_SCALE,
-                "features": {},
-                "desktops": None,
-            }
+            return self.bad_config()
 
     def strip_jsonc_comments(self, text):
         """Removes `//` line comments so the config can be parsed as JSONC.
@@ -396,7 +470,7 @@ class WorkspaceOverlay:
         """Reads optional toolbar features declared in the config object."""
         features = {}
 
-        move_window = config.get("opt_feature_movewindow")
+        move_window = config.get("opt_toolbar_feature_movewindow")
         if move_window is not None and move_window is not False:
             settings = move_window if isinstance(move_window, dict) else {}
             label = settings.get("label", DEFAULT_MOVE_WINDOW_LABEL)
@@ -404,7 +478,7 @@ class WorkspaceOverlay:
                 label = DEFAULT_MOVE_WINDOW_LABEL
             features["movewindow"] = {"label": label}
 
-        pin_window = config.get("opt_feature_pinwindow")
+        pin_window = config.get("opt_toolbar_feature_pinwindow")
         if pin_window is not None and pin_window is not False:
             settings = pin_window if isinstance(pin_window, dict) else {}
             label_pin = settings.get("label_pin", DEFAULT_PIN_WINDOW_LABEL)
@@ -415,7 +489,7 @@ class WorkspaceOverlay:
                 label_unpin = DEFAULT_UNPIN_WINDOW_LABEL
             features["pinwindow"] = {"label_pin": label_pin, "label_unpin": label_unpin}
 
-        shortcuts = config.get("opt_feature_shortcuts")
+        shortcuts = config.get("opt_component_feature_shortcuts")
         if shortcuts is not None and shortcuts is not False:
             settings = shortcuts if isinstance(shortcuts, dict) else {}
 
@@ -543,38 +617,50 @@ class WorkspaceOverlay:
         return labels
 
     def build_workspace_list(self):
-        """Resolves target monitors and builds the overlay on each of them."""
+        """Resolves per-monitor configs and builds the overlay on each monitor."""
         total_desktops = self.get_desktop_count()
-        config = self.get_workspace_config()
         self.displayed_desktop_count = total_desktops
-        self.workspace_font_color = config["font_color"]
-        self.workspace_surface_color = config["surface_color"]
-        self.workspace_size_scale = config["size_scale"]
 
-        # (Re)create one window per selected monitor (all monitors by default).
-        rects = self.target_monitor_rects(config.get("desktops"))
-        self.sync_panels(rects)
+        # (Re)create one window per target monitor, each with its own config.
+        targets = self.resolve_render_targets()
+        self.sync_panels(targets)
 
-        # Optional per-workspace notification indicator settings.
-        self.notification_settings = config["features"].get("notifications")
+        # Notifications are tracked globally if ANY rendered config enables them;
+        # each panel still renders the mark using its own indicator/colour.
+        self.notifications_enabled = any(
+            panel.config["features"].get("notifications") is not None
+            for panel in self.panels
+        )
         # Drop any pending marks for desktops that no longer exist.
         self.notified_desktops = {
             n for n in self.notified_desktops if 1 <= n <= total_desktops
         }
 
-        # Reset global toolbar state, then render the same content per monitor.
+        # Reset global toolbar state, then render each panel from its config.
         self.move_mode = False
         self.tracked_pinned = None
         for panel in self.panels:
-            self.build_panel(panel, config, total_desktops)
+            self.build_panel(panel, total_desktops)
 
         # Paint any already-pending notification marks onto the fresh labels.
         self.refresh_notifications()
 
         self.config_mtime = self.get_config_mtime()
 
-    def build_panel(self, panel, config, total_desktops):
+    def build_panel(self, panel, total_desktops):
         """Creates clickable labels dynamically for every desktop on a window."""
+        config = panel.config
+        # Cache this panel's style, and mirror it to the build-context fields
+        # used by scaled_size and the toolbar/shortcut builders below.
+        panel.font_color = config["font_color"]
+        panel.surface_color = config["surface_color"]
+        panel.size_scale = config["size_scale"]
+        panel.features = config["features"]
+        panel.notification_settings = config["features"].get("notifications")
+        self.workspace_font_color = panel.font_color
+        self.workspace_surface_color = panel.surface_color
+        self.workspace_size_scale = panel.size_scale
+
         win = panel.win
         # Clear existing widgets before rebuilding the config button and labels.
         # Secondary monitor windows are Tk children of the root, so skip any
@@ -674,10 +760,10 @@ class WorkspaceOverlay:
             panel.move_button = move_btn
 
         if "pinwindow" in features:
-            self.pin_labels = features["pinwindow"]
+            panel.pin_labels = features["pinwindow"]
             pin_btn = tk.Label(
                 toolbar,
-                text=f" {self.pin_labels['label_pin']} ",
+                text=f" {panel.pin_labels['label_pin']} ",
                 font=("Segoe UI", self.scaled_size(11), "bold"),
                 bg=COLOR_HIT_BG,
                 fg=self.workspace_font_color,
@@ -696,7 +782,7 @@ class WorkspaceOverlay:
             if panel.move_button is not None:
                 panel.move_button.configure(
                     bg=COLOR_ACTIVE_BG if enabled else COLOR_HIT_BG,
-                    fg=COLOR_TEXT_ACTIVE if enabled else self.workspace_font_color,
+                    fg=COLOR_TEXT_ACTIVE if enabled else panel.font_color,
                 )
 
     def toggle_move_mode(self):
@@ -864,15 +950,15 @@ class WorkspaceOverlay:
                 continue
             if pinned:
                 panel.pin_button.configure(
-                    text=f" {self.pin_labels['label_unpin']} ",
+                    text=f" {panel.pin_labels['label_unpin']} ",
                     bg=COLOR_ACTIVE_BG,
                     fg=COLOR_TEXT_ACTIVE,
                 )
             else:
                 panel.pin_button.configure(
-                    text=f" {self.pin_labels['label_pin']} ",
+                    text=f" {panel.pin_labels['label_pin']} ",
                     bg=COLOR_HIT_BG,
-                    fg=self.workspace_font_color,
+                    fg=panel.font_color,
                 )
 
     def toggle_pin_window(self):
@@ -1162,21 +1248,23 @@ class WorkspaceOverlay:
             return
         base = panel.label_base_text.get(idx, lbl.cget("text"))
         is_active = idx == panel.highlighted_desktop_num
-        notified = self.notification_settings is not None and idx in self.notified_desktops
-        bg = COLOR_ACTIVE_BG if is_active else self.workspace_surface_color
+        notified = panel.notification_settings is not None and idx in self.notified_desktops
+        bg = COLOR_ACTIVE_BG if is_active else panel.surface_color
         if notified:
-            fg = self.notification_settings["color"]
-            text = f" {base.strip()} {self.notification_settings['indicator']} "
+            fg = panel.notification_settings["color"]
+            text = f" {base.strip()} {panel.notification_settings['indicator']} "
         else:
-            fg = self.workspace_font_color
+            fg = panel.font_color
             text = base
         lbl.config(fg=fg, bg=bg, text=text)
 
     def refresh_notifications(self):
         """Repaints labels whose pending-notification state changed (per panel)."""
-        if self.notification_settings is None:
+        if not self.notifications_enabled:
             return
         for panel in self.panels:
+            if panel.notification_settings is None:
+                continue
             valid = set(panel.label_widgets.keys())
             want = self.notified_desktops & valid
             for idx in want ^ panel.marked_desktops:
@@ -1192,7 +1280,7 @@ class WorkspaceOverlay:
 
     def on_window_flash(self, hwnd):
         """Marks the workspace of a window that is requesting attention."""
-        if self.notification_settings is None:
+        if not self.notifications_enabled:
             return
         num = self.window_desktop_number(hwnd)
         if num is None or num in self.notified_desktops:
@@ -1202,7 +1290,7 @@ class WorkspaceOverlay:
 
     def on_window_activated(self, hwnd):
         """Clears a workspace's mark once one of its windows gets focus."""
-        if self.notification_settings is None or not self.notified_desktops:
+        if not self.notifications_enabled or not self.notified_desktops:
             return
         num = self.window_desktop_number(hwnd)
         if num is not None and num in self.notified_desktops:
@@ -1354,9 +1442,12 @@ class WorkspaceOverlay:
                         panel.highlighted_desktop_num = current_desktop_num
                         for idx in panel.label_widgets:
                             self.style_label(panel, idx)
-                        panel.marked_desktops = self.notified_desktops & set(
-                            panel.label_widgets.keys()
-                        )
+                        if panel.notification_settings is not None:
+                            panel.marked_desktops = self.notified_desktops & set(
+                                panel.label_widgets.keys()
+                            )
+                        else:
+                            panel.marked_desktops = set()
 
                 # Reflect the focused window's pinned state on the pin button.
                 self.refresh_pin_button()
