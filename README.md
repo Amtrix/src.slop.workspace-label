@@ -94,6 +94,96 @@ The JSON config controls the displayed workspace names, text color, label surfac
 
 If you have more virtual desktops than names, the app falls back to numbered labels such as `[8]`. The `font_rgba` value uses red, green, blue, and alpha values. The `surface_rgba` value (same red, green, blue, alpha format) sets the clickable background painted behind each label; it defaults to a near-black `[2, 2, 2, 1.0]` so the whole padded label area is clickable while staying nearly invisible. The `size_scale` value accepts `0.5` through `3.0`, where `1.0` is the default size.
 
+The config file is parsed as JSONC, so you can add `//` line comments to annotate your settings.
+
+#### Choosing which monitors to use
+
+By default the overlay is rendered on **every** monitor. Add an optional `desktops` array to limit it to specific monitors:
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  // Render the overlay only on the first and third monitors.
+  "desktops": [1, 3]
+}
+```
+
+`desktops` is an array of 1-based monitor indices. Index `1` is the left-most monitor; monitors are ordered left-to-right, then top-to-bottom (matching how Windows Display Settings arranges them). Any index outside the available range is ignored, and if none of the listed indices are valid the overlay falls back to rendering on all monitors. The overlay automatically rebuilds itself when a monitor is plugged in or unplugged.
+
+#### Optional toolbar features
+
+A toolbar can appear underneath the workspace list, populated by optional features you enable in the config. Each feature is declared with an `opt_feature_*` key whose value is an object of settings.
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  // Adds a button that moves the focused window to the next workspace you click.
+  "opt_feature_movewindow": {
+    "label": "Move Window"
+  },
+  // Adds a button that pins/unpins the focused window across all workspaces.
+  "opt_feature_pinwindow": {
+    "label_pin": "Pin Window",
+    "label_unpin": "Unpin Window"
+  }
+}
+```
+
+`opt_feature_movewindow` adds a button to the toolbar. Click it to arm move mode, then click a workspace label to move the currently focused window to that virtual desktop. Its `label` property sets the button text and defaults to `Move Window`.
+
+`opt_feature_pinwindow` adds a button that pins or unpins the currently focused window so it stays visible across every virtual desktop. The button automatically reflects the focused window's current state: it shows `label_pin` (default `Pin Window`) when the window is not pinned and `label_unpin` (default `Unpin Window`) when it is. Clicking the button flips that state for the focused window.
+
+`opt_feature_shortcuts` adds a grid of clickable shortcuts that launch programs or files. It takes two properties:
+
+- `column_count` (integer `>= 1`) — how many columns to split the shortcut list across. Entries fill left-to-right, top-to-bottom.
+- `entries` — a list of shortcut objects. Each entry supports:
+  - `label` — the text shown on the shortcut (falls back to `path` if omitted).
+  - `path` — the program or file to open (required). Environment variables such as `%LOCALAPPDATA%` are expanded.
+  - `arguments` — optional command-line arguments passed when launching.
+  - `opt_icon` — optional path to a `PNG`/`GIF` icon. If omitted or it fails to load, a placeholder glyph is shown instead.
+
+It also accepts two optional border properties that, when both are set, draw a border around the whole shortcut grid:
+
+- `border_width` — a non-negative integer thickness (in pixels, scaled with `size_scale`).
+- `border_color` — either an RGBA list (same format as `font_rgba`) or a hex string such as `"#FFB300"`.
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  "opt_feature_shortcuts": {
+    "column_count": 2,
+    "border_width": 1,
+    "border_color": "#554422",
+    "entries": [
+      { "label": "Notepad", "path": "notepad.exe" },
+      {
+        "label": "Project A",
+        "path": "C:\\Windows\\explorer.exe",
+        "arguments": "E:\\projects\\Desktop-Labeller",
+        "opt_icon": "C:\\icons\\folder.png"
+      }
+    ]
+  }
+}
+```
+
+`opt_feature_notifications` marks a workspace label when one of its windows requests attention (the same signal that flashes a taskbar button — for example a Teams/Slack/Discord ping or a dialog needing input). The mark appears on the corresponding label across every monitor the overlay renders on, so you can see at a glance which workspace wants you. It takes two optional properties:
+
+- `indicator` — the glyph appended to a flagged workspace label (defaults to `●`).
+- `color` — the indicator/label color while flagged, as a hex string such as `"#FF3333"` or an RGBA list (same format as `font_rgba`).
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  "opt_feature_notifications": {
+    "indicator": "●",
+    "color": "#FF3333"
+  }
+}
+```
+
+A mark clears automatically when you switch to that workspace, or when you activate the window that was asking for attention. Notifications on the workspace you are currently viewing are flagged too; they clear once you focus the relevant window. Note that this detects taskbar "needs attention" flashes — not arbitrary toast/notification-center popups, which Windows does not expose per window.
+
 If an older local `desktops.txt` exists beside the script, the app copies those names into the AppData JSON config the first time it creates the new config file.
 
 Click the gear at the far left of the overlay to open the config file in your default text editor. Saved changes are picked up automatically while the overlay is running.
