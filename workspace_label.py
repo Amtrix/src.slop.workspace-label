@@ -22,6 +22,9 @@ DEFAULT_SURFACE_RGBA = [2, 2, 2, 1.0]
 DEFAULT_SIZE_SCALE = 1.0
 # Optional toolbar features. Each maps a config key to its default settings.
 DEFAULT_MOVE_WINDOW_LABEL = "Move Window"
+# While move mode is armed, the button text walks through these two phases.
+MOVE_SELECT_WINDOW_LABEL = "Select window."
+MOVE_SELECT_WORKSPACE_LABEL = "Select workspace."
 DEFAULT_PIN_WINDOW_LABEL = "Pin Window"
 DEFAULT_UNPIN_WINDOW_LABEL = "Unpin Window"
 # Glyph shown for a shortcut that does not specify (or fails to load) an icon.
@@ -76,6 +79,8 @@ class OverlayPanel:
             "label_pin": DEFAULT_PIN_WINDOW_LABEL,
             "label_unpin": DEFAULT_UNPIN_WINDOW_LABEL,
         }
+        # Idle text for this panel's "move window" toolbar button.
+        self.move_label = DEFAULT_MOVE_WINDOW_LABEL
         self.label_widgets = {}
         self.label_base_text = {}
         self.marked_desktops = set()
@@ -110,6 +115,11 @@ class WorkspaceOverlay:
 
         # Optional "move window" toolbar feature state (global across monitors).
         self.move_mode = False
+        # While move mode is armed, the window the user picked to move (None
+        # until they focus one), plus the window that was focused when move
+        # mode was armed (used to detect that pick).
+        self.move_selected_hwnd = None
+        self.move_baseline_hwnd = None
         # Last external (non-overlay) foreground window; the pin/move actions
         # and the pin button's displayed state both track this window.
         self.tracked_hwnd = None
@@ -638,6 +648,8 @@ class WorkspaceOverlay:
 
         # Reset global toolbar state, then render each panel from its config.
         self.move_mode = False
+        self.move_selected_hwnd = None
+        self.move_baseline_hwnd = None
         self.tracked_pinned = None
         for panel in self.panels:
             self.build_panel(panel, total_desktops)
@@ -745,9 +757,10 @@ class WorkspaceOverlay:
         toolbar.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
 
         if "movewindow" in features:
+            panel.move_label = features["movewindow"]["label"]
             move_btn = tk.Label(
                 toolbar,
-                text=f" {features['movewindow']['label']} ",
+                text=f" {panel.move_label} ",
                 font=("Segoe UI", self.scaled_size(11), "bold"),
                 bg=COLOR_ACTIVE_BG if self.move_mode else COLOR_HIT_BG,
                 fg=COLOR_TEXT_ACTIVE if self.move_mode else self.workspace_font_color,
@@ -776,14 +789,73 @@ class WorkspaceOverlay:
             panel.pin_button = pin_btn
 
     def set_move_mode(self, enabled):
-        """Toggles move-window mode and reflects it on every toolbar button."""
+        """Arms/disarms move-window mode and refreshes every toolbar button."""
         self.move_mode = enabled
+        if enabled:
+            # Record the raw foreground window at arm time. Clicking the toolbar
+            # button activates our (clickable) overlay, so this is normally one
+            # of our own windows; the user's next click moves focus to a real
+            # window, which we then capture as the selection (see
+            # update_move_selection). Using the RAW foreground here - not the
+            # filtered tracked window - is what lets the user pick the very
+            # window they already had focused.
+            self.move_selected_hwnd = None
+            try:
+                self.move_baseline_hwnd = win32gui.GetForegroundWindow()
+            except Exception:
+                self.move_baseline_hwnd = None
+        else:
+            self.move_selected_hwnd = None
+            self.move_baseline_hwnd = None
+        self.update_move_button()
+
+    def update_move_button(self):
+        """Reflects the current move-mode phase on every move button.
+
+        Idle shows the configured label; once armed it shows "Select window."
+        until the user picks a window, then "Select workspace.".
+        """
         for panel in self.panels:
-            if panel.move_button is not None:
-                panel.move_button.configure(
-                    bg=COLOR_ACTIVE_BG if enabled else COLOR_HIT_BG,
-                    fg=COLOR_TEXT_ACTIVE if enabled else panel.font_color,
-                )
+            if panel.move_button is None:
+                continue
+            if not self.move_mode:
+                text = panel.move_label
+                active = False
+            elif self.move_selected_hwnd is None:
+                text = MOVE_SELECT_WINDOW_LABEL
+                active = True
+            else:
+                text = MOVE_SELECT_WORKSPACE_LABEL
+                active = True
+            panel.move_button.configure(
+                text=f" {text} ",
+                bg=COLOR_ACTIVE_BG if active else COLOR_HIT_BG,
+                fg=COLOR_TEXT_ACTIVE if active else panel.font_color,
+            )
+
+    def update_move_selection(self):
+        """While awaiting a window pick, capture the first real (non-overlay)
+        window the user gives focus to once move mode is armed."""
+        if not self.move_mode or self.move_selected_hwnd is not None:
+            return
+        try:
+            fg = win32gui.GetForegroundWindow()
+        except Exception:
+            fg = 0
+        # Ignore: nothing focused, still on the arm-time window (our overlay),
+        # our own overlay/tray windows, or the desktop/taskbar shell windows.
+        if not fg or fg == self.move_baseline_hwnd:
+            return
+        if fg in self.panel_hwnds() or fg == self.tray_hwnd:
+            return
+        try:
+            cls = win32gui.GetClassName(fg)
+        except Exception:
+            cls = ""
+        if cls in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return
+        self.move_selected_hwnd = fg
+        self.update_move_button()
 
     def toggle_move_mode(self):
         self.set_move_mode(not self.move_mode)
@@ -1233,9 +1305,13 @@ class WorkspaceOverlay:
             pass
 
     def move_active_window(self, desktop_num):
-        """Moves the currently focused window to the chosen virtual desktop."""
+        """Moves the window picked during move mode to the chosen desktop."""
+        hwnd = self.move_selected_hwnd
         try:
-            AppView.current().move(VirtualDesktop(desktop_num))
+            if hwnd:
+                AppView(hwnd=hwnd).move(VirtualDesktop(desktop_num))
+            else:
+                AppView.current().move(VirtualDesktop(desktop_num))
         except Exception:
             pass
         finally:
@@ -1451,6 +1527,9 @@ class WorkspaceOverlay:
 
                 # Reflect the focused window's pinned state on the pin button.
                 self.refresh_pin_button()
+
+                # While move mode is armed, watch for the user picking a window.
+                self.update_move_selection()
 
                 if self.pin_to_background:
                     # Enforce background positioning order, but only when the

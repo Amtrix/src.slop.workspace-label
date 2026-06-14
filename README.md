@@ -152,7 +152,7 @@ A toolbar can appear underneath the workspace list, populated by optional featur
 }
 ```
 
-`opt_toolbar_feature_movewindow` adds a button to the toolbar. Click it to arm move mode, then click a workspace label to move the currently focused window to that virtual desktop. Its `label` property sets the button text and defaults to `Move Window`.
+`opt_toolbar_feature_movewindow` adds a button to the toolbar. Click it to arm move mode: the button highlights and its text changes to **Select window.** Click (focus) the window you want to move and the text changes to **Select workspace.**; then click a workspace label to send that window to the chosen virtual desktop. Click the button again to cancel. Its `label` property sets the button's idle text and defaults to `Move Window`.
 
 `opt_toolbar_feature_pinwindow` adds a button that pins or unpins the currently focused window so it stays visible across every virtual desktop. The button automatically reflects the focused window's current state: it shows `label_pin` (default `Pin Window`) when the window is not pinned and `label_unpin` (default `Unpin Window`) when it is. Clicking the button flips that state for the focused window.
 
@@ -275,6 +275,19 @@ Run PowerShell as Administrator for these commands. Because Windows services run
 - Change `size_scale` in the JSON config to resize the overlay.
 - Change the `root.geometry("+20+20")` value in `workspace_label.py` to move the overlay.
 - Change `lbl.pack(side="left", padx=2)` to `side="top"` in `workspace_label.py` if you prefer a vertical list.
+
+## Performance
+
+Desktop Labeller is built to stay effectively invisible to your CPU and GPU while it sits on the desktop. It is a single lightweight Tkinter overlay (one window per monitor it renders on) and spends almost all of its time idle.
+
+- **Low-frequency polling.** A single timer loop runs about every 400 ms to check the active desktop, monitor layout, and config file. There is no busy-waiting or per-frame rendering.
+- **Event-driven notifications.** The `opt_feature_notifications` feature reacts to Windows shell-hook messages (the same taskbar-flash signal), so it does no extra polling — it only does work when a window actually requests attention.
+- **Idempotent repaints (no idle redraw).** Widgets are reconfigured only when something actually changes (the active desktop, a window's pin state, or the config file). Because the overlay uses a layered `-transparentcolor` window, reconfiguring widgets every tick would force Windows to recomposite the whole window, so the loop deliberately skips that work when nothing changed. The practical effect is zero ongoing GPU compositing while you stay on one desktop.
+- **Focus-gated window ordering.** When pinned to the background, the overlay only re-asserts its bottom-most z-order when the foreground window changes, not on every tick — avoiding needless `SetWindowPos` churn (and the recompositing it would trigger).
+- **Fullscreen yield.** When a fullscreen app (e.g. a game or full-screen video) is in the foreground, the overlay withdraws its windows and slows its loop to about once per second, so it cannot affect the game's frame rate or the compositor and stays essentially dormant until you return to the desktop.
+- **Config reloads only on change.** The config file is re-read and the overlay rebuilt only when the file's modification time changes (or a monitor/desktop is added or removed), not on a schedule.
+
+In practice the app idles at a negligible fraction of one CPU core and adds no continuous GPU load. Rebuilds (config edits, monitor hot-plug, desktop count changes) are brief one-off operations.
 
 ## Troubleshooting
 
