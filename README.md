@@ -94,6 +94,20 @@ The JSON config controls the displayed workspace names, text color, label surfac
 
 If you have more virtual desktops than names, the app falls back to numbered labels such as `[8]`. The `font_rgba` value uses red, green, blue, and alpha values. The `surface_rgba` value (same red, green, blue, alpha format) sets the clickable background painted behind each label; it defaults to a near-black `[2, 2, 2, 1.0]` so the whole padded label area is clickable while staying nearly invisible. The `size_scale` value accepts `0.5` through `3.0`, where `1.0` is the default size.
 
+The overlay is anchored to the **top edge** of its monitor. Use the optional `offset` object to nudge it away from that corner:
+
+```json
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  "offset": {
+    "X": 20,
+    "Y": 0
+  }
+}
+```
+
+`X` shifts the content right from the left edge and `Y` shifts it down from the top edge (both in pixels, default `0`). Each `desktop:` block can set its own `offset`.
+
 ### Per-label colors
 
 By default every workspace name uses the shared `font_rgba` text color. To give an individual label its own color, replace that string in `"names"` with an object that carries a `name` plus a color. The color can be a hex string (`"color"`) or an RGBA list (`"font_rgba"`, same format as the top-level value). Plain strings and colored objects can be mixed freely:
@@ -111,6 +125,20 @@ By default every workspace name uses the shared `font_rgba` text color. To give 
 ```
 
 Labels without an explicit color keep the shared `font_rgba`. The per-label color only affects the idle text; the active-desktop highlight and notification color still take precedence when those states apply.
+
+To recolor **all** labels at once without touching `font_rgba`, set a top-level `names_color` (hex string or RGBA list). Individual entries still override it:
+
+```json
+{
+  "names": [
+    "[1] first workspace",
+    { "name": "[2] alerts", "color": "#FF3333" }
+  ],
+  "names_color": "#88AACC"
+}
+```
+
+Here every label is `#88AACC` except `[2] alerts`, which stays red.
 
 
 The config file is parsed as JSONC, so you can add `//` line comments to annotate your settings.
@@ -178,12 +206,13 @@ A toolbar can appear underneath the workspace list, populated by optional featur
 `opt_component_feature_shortcuts` adds a grid of clickable shortcuts that launch programs or files. It takes two properties:
 
 - `column_count` (integer `>= 1`) — how many columns to split the shortcut list across. Entries fill left-to-right, top-to-bottom.
+- `entries_color` (or `font_rgba`-style RGBA list / hex string) — optional default text/icon color applied to every shortcut. Individual entries can still override it.
 - `entries` — a list of shortcut objects. Each entry supports:
   - `label` — the text shown on the shortcut (falls back to `path` if omitted).
   - `path` — the program or file to open (required). Environment variables such as `%LOCALAPPDATA%` are expanded.
   - `arguments` — optional command-line arguments passed when launching.
   - `opt_icon` — optional path to a `PNG`/`GIF` icon. If omitted or it fails to load, a placeholder glyph is shown instead.
-  - `color` (or `font_rgba`) — optional per-shortcut text/icon color, as a hex string such as `"#3399FF"` or an RGBA list (same format as the top-level `font_rgba`). Omit it to use the shared label color.
+  - `color` (or `font_rgba`) — optional per-shortcut text/icon color, as a hex string such as `"#3399FF"` or an RGBA list (same format as the top-level `font_rgba`). Omit it to use `entries_color` if set, otherwise the shared label color.
 
 It also accepts two optional border properties that, when both are set, draw a border around the whole shortcut grid:
 

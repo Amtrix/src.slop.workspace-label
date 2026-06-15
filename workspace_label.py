@@ -198,10 +198,15 @@ class WorkspaceOverlay:
             except Exception:
                 pass
 
-    def position_window(self, win, monitor_rect):
-        """Positions a window near the top-left of its target monitor."""
+    def position_window(self, win, monitor_rect, offset=(0, 0)):
+        """Positions a window at the top edge of its monitor, plus offset.
+
+        ``offset`` is an ``(x, y)`` pixel shift from the monitor's top-left
+        corner, configurable per ``desktop`` block via the ``offset`` key.
+        """
         left, top = (monitor_rect[0], monitor_rect[1]) if monitor_rect else (0, 0)
-        win.geometry(f"+{left + 20}+{top + 20}")
+        offset_x, offset_y = offset
+        win.geometry(f"+{left + offset_x}+{top + offset_y}")
 
     def get_monitor_rects(self):
         """Returns monitor rectangles ordered left-to-right, top-to-bottom."""
@@ -313,13 +318,13 @@ class WorkspaceOverlay:
         self.panels[0].monitor_rect = rect0
         self.panels[0].config = config0
         self.panels[0].hwnd = None
-        self.position_window(self.root, rect0)
+        self.position_window(self.root, rect0, config0.get("offset", (0, 0)))
 
         # Secondary monitors get their own Toplevel windows.
         for rect, config in targets[1:]:
             win = tk.Toplevel(self.root)
             self.style_window(win)
-            self.position_window(win, rect)
+            self.position_window(win, rect, config.get("offset", (0, 0)))
             panel = OverlayPanel(win, rect)
             panel.config = config
             self.panels.append(panel)
@@ -417,8 +422,28 @@ class WorkspaceOverlay:
             "font_color": COLOR_BAD_CONFIG,
             "surface_color": COLOR_HIT_BG,
             "size_scale": DEFAULT_SIZE_SCALE,
+            "offset": (0, 0),
             "features": {},
         }
+
+    def parse_offset(self, value):
+        """Returns an ``(x, y)`` pixel offset from the monitor's top-left edge.
+
+        Accepts an object with ``X``/``Y`` (case-insensitive) integer keys.
+        Missing or invalid values default to ``0``.
+        """
+        if not isinstance(value, dict):
+            return (0, 0)
+
+        def channel(*keys):
+            for key in keys:
+                raw = value.get(key)
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    continue
+                return int(raw)
+            return 0
+
+        return (channel("X", "x"), channel("Y", "y"))
 
     def parse_single_config(self, config):
         """Validates one config object into the normalized render dict."""
@@ -429,6 +454,14 @@ class WorkspaceOverlay:
             names_raw = config.get("names")
             if not isinstance(names_raw, list):
                 raise ValueError()
+            # Optional default text color applied to every label, which any
+            # individual entry can still override.
+            raw_names_color = config.get("names_color")
+            default_name_color = (
+                self.parse_border_color(raw_names_color)
+                if raw_names_color is not None
+                else None
+            )
             # Each entry is either a plain string, or an object
             # {"name": "...", "font_rgba"/"color": <rgba list or hex>} that
             # overrides the per-label text color.
@@ -437,7 +470,7 @@ class WorkspaceOverlay:
             for entry in names_raw:
                 if isinstance(entry, str):
                     names.append(entry.strip())
-                    name_colors.append(None)
+                    name_colors.append(default_name_color)
                 elif isinstance(entry, dict):
                     name = entry.get("name", "")
                     if not isinstance(name, str):
@@ -447,7 +480,7 @@ class WorkspaceOverlay:
                     name_colors.append(
                         self.parse_border_color(raw_color)
                         if raw_color is not None
-                        else None
+                        else default_name_color
                     )
                 else:
                     raise ValueError()
@@ -462,6 +495,7 @@ class WorkspaceOverlay:
                 "font_color": self.rgba_to_hex(font_rgba),
                 "surface_color": self.rgba_to_hex(surface_rgba),
                 "size_scale": size_scale,
+                "offset": self.parse_offset(config.get("offset")),
                 "features": self.parse_optional_features(config),
             }
         except Exception:
@@ -539,6 +573,14 @@ class WorkspaceOverlay:
                 column_count = 1
 
             raw_entries = settings.get("entries", [])
+            # Optional default color applied to every shortcut, which any
+            # individual entry can still override.
+            raw_entries_color = settings.get("entries_color")
+            default_entry_color = (
+                self.parse_border_color(raw_entries_color)
+                if raw_entries_color is not None
+                else None
+            )
             entries = []
             if isinstance(raw_entries, list):
                 for item in raw_entries:
@@ -560,7 +602,7 @@ class WorkspaceOverlay:
                     color = (
                         self.parse_border_color(raw_color)
                         if raw_color is not None
-                        else None
+                        else default_entry_color
                     )
                     entries.append(
                         {
