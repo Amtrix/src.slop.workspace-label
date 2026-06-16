@@ -91,6 +91,10 @@ class OverlayPanel:
         self.pin_button = None
         self.highlighted_desktop_num = None
         self.shortcut_icons = []
+        # Cached shortcut frame + config so the grid can be rebuilt on desktop
+        # change when entries are filtered by the "workspaces" property.
+        self.shortcuts_frame = None
+        self.shortcuts_config = None
         self.hwnd = None
 
     def get_hwnd(self):
@@ -181,6 +185,7 @@ class WorkspaceOverlay:
 
         # 3. Start monitoring active desktop state
         self.update_loop()
+        self.track_desktop_loop()
 
     def style_window(self, win):
         """Applies the borderless, transparent, top-most overlay styling."""
@@ -445,6 +450,25 @@ class WorkspaceOverlay:
 
         return (channel("X", "x"), channel("Y", "y"))
 
+    def parse_workspaces(self, value):
+        """Parses a comma-separated string of 1-based desktop numbers.
+
+        Returns a set of ints for ``"1,2,3"`` style values, or ``None`` when the
+        value is absent/empty/invalid (meaning the entry shows on every desktop).
+        """
+        if not isinstance(value, str) or not value.strip():
+            return None
+        result = set()
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                result.add(int(part))
+            except ValueError:
+                continue
+        return result or None
+
     def parse_single_config(self, config):
         """Validates one config object into the normalized render dict."""
         try:
@@ -604,6 +628,7 @@ class WorkspaceOverlay:
                         if raw_color is not None
                         else default_entry_color
                     )
+                    workspaces = self.parse_workspaces(item.get("workspaces"))
                     entries.append(
                         {
                             "label": label,
@@ -611,6 +636,7 @@ class WorkspaceOverlay:
                             "arguments": arguments,
                             "icon": icon,
                             "color": color,
+                            "workspaces": workspaces,
                         }
                     )
 
@@ -620,6 +646,9 @@ class WorkspaceOverlay:
                     "entries": entries,
                     "border_width": self.parse_border_width(settings.get("border_width")),
                     "border_color": self.parse_border_color(settings.get("border_color")),
+                    "has_workspace_filter": any(
+                        entry["workspaces"] is not None for entry in entries
+                    ),
                 }
 
         notifications = config.get("opt_feature_notifications")
@@ -764,6 +793,8 @@ class WorkspaceOverlay:
         panel.move_button = None
         panel.pin_button = None
         panel.shortcut_icons = []
+        panel.shortcuts_frame = None
+        panel.shortcuts_config = None
         # Force the update loop to repaint the active-desktop highlight after a
         # full rebuild, since all label widgets were just recreated.
         panel.highlighted_desktop_num = None
@@ -945,9 +976,47 @@ class WorkspaceOverlay:
     def toggle_move_mode(self):
         self.set_move_mode(not self.move_mode)
 
+    def rebuild_panel_shortcuts(self, panel):
+        """Rebuilds just this panel's shortcut grid for the current desktop.
+
+        Restores the per-panel build context (font color/scale) that
+        ``build_shortcuts`` relies on, then re-runs it using the cached config.
+        """
+        if panel.shortcuts_config is None:
+            return
+        self.workspace_font_color = panel.font_color
+        self.workspace_surface_color = panel.surface_color
+        self.workspace_size_scale = panel.size_scale
+        self.build_shortcuts(panel, panel.shortcuts_config)
+
     def build_shortcuts(self, panel, shortcuts):
-        """Builds the optional shortcut launcher grid under the toolbar."""
+        """Builds the optional shortcut launcher grid under the toolbar.
+
+        Entries may be limited to specific virtual desktops via their
+        ``workspaces`` set; only those matching the current desktop are shown.
+        The config is cached so the grid can be cheaply rebuilt when the active
+        desktop changes (only happens on a real switch, never per tick).
+        """
         panel.shortcut_icons = []
+        panel.shortcuts_config = shortcuts
+
+        # Drop a previously built grid (used when rebuilding on desktop change).
+        if panel.shortcuts_frame is not None:
+            try:
+                panel.shortcuts_frame.destroy()
+            except Exception:
+                pass
+            panel.shortcuts_frame = None
+
+        current_desktop = self.last_active_desktop
+        visible_entries = [
+            entry
+            for entry in shortcuts["entries"]
+            if entry["workspaces"] is None
+            or (current_desktop is not None and current_desktop in entry["workspaces"])
+        ]
+        if not visible_entries:
+            return
 
         # NOTE: the frame's background must be an opaque (non-keyed) color.
         # Using COLOR_BG (the -transparentcolor key) for the surrounding/gap
@@ -955,6 +1024,7 @@ class WorkspaceOverlay:
         # those transparent edges, which shows up as a ~1px diagonal "wiggle".
         frame = tk.Frame(panel.win, bg=COLOR_HIT_BG)
         frame.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
+        panel.shortcuts_frame = frame
 
         # Optional border drawn around the whole shortcut grid.
         border_width = shortcuts.get("border_width", 0)
@@ -970,7 +1040,7 @@ class WorkspaceOverlay:
         for col in range(column_count):
             frame.grid_columnconfigure(col, weight=1, uniform="shortcuts")
 
-        for index, entry in enumerate(shortcuts["entries"]):
+        for index, entry in enumerate(visible_entries):
             row = index // column_count
             col = index % column_count
 
@@ -1253,7 +1323,11 @@ class WorkspaceOverlay:
         except queue.Empty:
             pass
         try:
-            self.root.after(100, self.drain_tray_actions)
+            # Drains often so event-driven actions (e.g. the immediate
+            # desktop-highlight refresh on window activation) are applied with
+            # low latency. This is a non-blocking queue check, so the higher
+            # cadence adds no measurable cost when the queue is empty.
+            self.root.after(25, self.drain_tray_actions)
         except Exception:
             pass
 
@@ -1291,6 +1365,10 @@ class WorkspaceOverlay:
             if wparam == HSHELL_FLASH and lparam:
                 self.tray_action_queue.put(lambda h=lparam: self.on_window_flash(h))
             elif wparam in (HSHELL_WINDOWACTIVATED, HSHELL_RUDEAPPACTIVATED) and lparam:
+                # A window activation usually means a virtual-desktop switch, so
+                # refresh the highlight immediately instead of waiting for the
+                # backstop poll. Also clears any notification mark for it.
+                self.tray_action_queue.put(self.poll_active_desktop)
                 self.tray_action_queue.put(lambda h=lparam: self.on_window_activated(h))
             return 0
         if msg == WM_TRAYICON and wparam == TRAY_UID:
@@ -1551,6 +1629,62 @@ class WorkspaceOverlay:
         except Exception:
             return False
 
+    def refresh_active_desktop(self, current_desktop_num):
+        """Repaints the active-desktop highlight on any panel that drifted.
+
+        Guarded on ``panel.highlighted_desktop_num`` so labels are only
+        reconfigured on a real desktop change (never per tick), which avoids
+        the layered -transparentcolor recomposite "wiggle".
+        """
+        for panel in self.panels:
+            if current_desktop_num == panel.highlighted_desktop_num:
+                continue
+            panel.highlighted_desktop_num = current_desktop_num
+            for idx in panel.label_widgets:
+                self.style_label(panel, idx)
+            if panel.notification_settings is not None:
+                panel.marked_desktops = self.notified_desktops & set(
+                    panel.label_widgets.keys()
+                )
+            else:
+                panel.marked_desktops = set()
+            # Rebuild the shortcut grid only when entries are scoped to specific
+            # desktops, so the visible set tracks the active desktop. Runs on a
+            # real switch, not per tick, so it does not trigger the "wiggle".
+            if (
+                panel.shortcuts_config is not None
+                and panel.shortcuts_config.get("has_workspace_filter")
+            ):
+                self.rebuild_panel_shortcuts(panel)
+
+    def poll_active_desktop(self):
+        """Reads the current desktop number and repaints the highlight if moved.
+
+        Shared by the fast backstop poll and the event-driven activation path.
+        Cheap: a single COM read plus a guarded (no-op unless changed) repaint.
+        """
+        if self.hidden_for_fullscreen or not self.panels:
+            return
+        try:
+            current_desktop_num = VirtualDesktop.current().number
+        except Exception:
+            return
+        if current_desktop_num != self.last_active_desktop:
+            self.last_active_desktop = current_desktop_num
+            self.notified_desktops.discard(current_desktop_num)
+        self.refresh_active_desktop(current_desktop_num)
+
+    def track_desktop_loop(self):
+        """Backstop poll for desktop-switch responsiveness.
+
+        Switching virtual desktops fires a shell-hook window-activation event
+        which already drives an immediate highlight refresh, so this poll only
+        needs to catch the rare cases that emit no activation (e.g. switching to
+        an empty desktop). It therefore runs slowly to keep COM traffic low.
+        """
+        self.poll_active_desktop()
+        self.root.after(150, self.track_desktop_loop)
+
     def update_loop(self):
         next_delay = 400
         try:
@@ -1596,21 +1730,10 @@ class WorkspaceOverlay:
                     self.last_active_desktop = current_desktop_num
                     self.notified_desktops.discard(current_desktop_num)
 
-                # Refresh visual highlights only when the active desktop changed.
-                # Reconfiguring labels every tick forces the layered
-                # -transparentcolor window to recomposite, which renders as a
-                # visible diagonal "wiggle" of the text/border.
-                for panel in self.panels:
-                    if current_desktop_num != panel.highlighted_desktop_num:
-                        panel.highlighted_desktop_num = current_desktop_num
-                        for idx in panel.label_widgets:
-                            self.style_label(panel, idx)
-                        if panel.notification_settings is not None:
-                            panel.marked_desktops = self.notified_desktops & set(
-                                panel.label_widgets.keys()
-                            )
-                        else:
-                            panel.marked_desktops = set()
+                # Repaint the active-desktop highlight if it drifted from the
+                # current desktop. The fast desktop tracker normally does this
+                # within ~75ms; this is a backstop after a full rebuild.
+                self.refresh_active_desktop(current_desktop_num)
 
                 # Reflect the focused window's pinned state on the pin button.
                 self.refresh_pin_button()

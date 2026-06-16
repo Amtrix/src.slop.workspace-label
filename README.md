@@ -213,6 +213,7 @@ A toolbar can appear underneath the workspace list, populated by optional featur
   - `arguments` — optional command-line arguments passed when launching.
   - `opt_icon` — optional path to a `PNG`/`GIF` icon. If omitted or it fails to load, a placeholder glyph is shown instead.
   - `color` (or `font_rgba`) — optional per-shortcut text/icon color, as a hex string such as `"#3399FF"` or an RGBA list (same format as the top-level `font_rgba`). Omit it to use `entries_color` if set, otherwise the shared label color.
+  - `workspaces` — optional comma-separated string of 1-based virtual-desktop numbers (e.g. `"1,3,5"`). When set, the shortcut only appears while you are on one of those desktops. Omit it to show the shortcut on every desktop.
 
 It also accepts two optional border properties that, when both are set, draw a border around the whole shortcut grid:
 
