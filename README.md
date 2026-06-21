@@ -39,6 +39,12 @@ From the project folder, install the runtime dependencies:
 pip install pyvda pywin32
 ```
 
+The optional "music highlight" feature (`opt_feature_musichighlight`) also needs `pycaw` and `psutil`; install them if you plan to use it (the app runs without them, with that feature disabled):
+
+```powershell
+pip install pycaw psutil
+```
+
 If you want to build the standalone executable, also install PyInstaller:
 
 ```powershell
@@ -195,6 +201,10 @@ A toolbar can appear underneath the workspace list, populated by optional featur
   "opt_toolbar_feature_pinwindow": {
     "label_pin": "Pin Window",
     "label_unpin": "Unpin Window"
+  },
+  // Adds a live clock to the toolbar, e.g. "Jun 5 - 23:23".
+  "opt_toolbar_feature_date_and_time": {
+    "color": "#FFB300"
   }
 }
 ```
@@ -202,6 +212,8 @@ A toolbar can appear underneath the workspace list, populated by optional featur
 `opt_toolbar_feature_movewindow` adds a button to the toolbar. Click it to arm move mode: the button highlights and its text changes to **Select window.** Click (focus) the window you want to move and the text changes to **Select workspace.**; then click a workspace label to send that window to the chosen virtual desktop. Click the button again to cancel. Its `label` property sets the button's idle text and defaults to `Move Window`.
 
 `opt_toolbar_feature_pinwindow` adds a button that pins or unpins the currently focused window so it stays visible across every virtual desktop. The button automatically reflects the focused window's current state: it shows `label_pin` (default `Pin Window`) when the window is not pinned and `label_unpin` (default `Unpin Window`) when it is. Clicking the button flips that state for the focused window.
+
+`opt_toolbar_feature_date_and_time` adds a live clock to the toolbar formatted like `Jun 5 - 23:23`, refreshed every second. Its optional `color` property sets the text color and accepts a hex string (`"#FFB300"`), a `font_rgba`-style RGBA list (`[255, 179, 0, 1.0]`), or an RGBA object (`{ "r": 255, "g": 179, "b": 0, "a": 1.0 }`, alpha optional). It falls back to the panel's font color when omitted.
 
 `opt_component_feature_shortcuts` adds a grid of clickable shortcuts that launch programs or files. It takes two properties:
 
@@ -256,6 +268,53 @@ It also accepts two optional border properties that, when both are set, draw a b
 ```
 
 A mark clears automatically when you switch to that workspace, or when you activate the window that was asking for attention. Notifications on the workspace you are currently viewing are flagged too; they clear once you focus the relevant window. Note that this detects taskbar "needs attention" flashes — not arbitrary toast/notification-center popups, which Windows does not expose per window.
+
+`opt_feature_musichighlight` adds a small music-note glyph to any workspace whose app is currently emitting sound, so you can spot where audio is coming from at a glance. It takes one optional property:
+
+- `indicator` — the glyph appended to a playing workspace label (defaults to a monochrome `♪`). The glyph inherits the label's existing text color; the music state does not recolor the label.
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  "opt_feature_musichighlight": {
+    "indicator": "♪"
+  }
+}
+```
+
+The app polls the Windows audio sessions about once a second and marks the desktop whose window belongs to a sound-emitting process; the glyph lingers briefly through short silent gaps (e.g. between tracks) so it does not flicker. Note that Windows routes all of a browser's tab audio through a single process and does not reveal which window (let alone which tab) is the source, so for an app whose windows are spread across several desktops the speaker is placed on its **most recently active** window's desktop — the best single guess for where the sound is coming from. A single-window media player maps exactly. This feature needs the optional `pycaw` and `psutil` packages; if they are not installed it silently stays off and the rest of the app runs normally.
+
+`opt_component_feature_timer` adds a small countdown-timer box under the overlay. Each timer shows the workspace it was created on as a `[N]` prefix, then its name and remaining time as `HH:MM:SS`, with an `✕` to remove just that timer; an **ADD** button opens a dialog asking for a name and a duration, and a **CLEAR** button removes all timers after a confirmation prompt. When a timer reaches `00:00:00` its time turns red and holds at zero, and the label of the workspace the timer was set on starts flashing as an alert. The flashing stops as soon as you click that label (even if you are already on that workspace). It takes two optional properties:
+
+- `workspaces` — a comma-separated list of 1-based virtual-desktop numbers (e.g. `"1, 2, 3"`); the box is only shown while the active desktop is one of them. Omit it (or use `{}`) to show the box on every desktop.
+- `default_new_time` — the duration pre-filled in the ADD dialog, as `HH:MM:SS` (also accepts `MM:SS` or `SS`). Defaults to `00:05:00` when omitted or invalid.
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  "opt_component_feature_timer": {
+    "workspaces": "1, 2, 3",
+    "default_new_time": "00:25:00"
+  }
+}
+```
+
+Timers are shared across all monitors and persisted to `desktops` config folder as `timers.json`, so they keep counting in real time even across an app restart (a timer that would have finished while the app was closed simply shows `00:00:00` on next launch).
+
+`opt_feature_hide_when_idle` hides the entire overlay while you are away and brings it back the moment you use the PC again. It takes one optional property:
+
+- `idle_seconds` — seconds of no keyboard or mouse input before the overlay hides. Defaults to `30` when omitted or invalid; must be a positive number.
+
+```jsonc
+{
+  "names": ["Work", "Web", "Chat", "Media"],
+  "opt_feature_hide_when_idle": {
+    "idle_seconds": 30
+  }
+}
+```
+
+Idle time is read from the system-wide last-input time, so any keypress or mouse movement counts as activity (even in another app). The overlay reappears within about half a second of your next input. The feature is global: if several monitor configs enable it with different thresholds, the smallest `idle_seconds` wins. A fullscreen app still hides the overlay regardless of this setting.
 
 If an older local `desktops.txt` exists beside the script, the app copies those names into the AppData JSON config the first time it creates the new config file.
 

@@ -3,13 +3,25 @@ import os
 import queue
 import sys
 import threading
+import time
 import ctypes
 from pathlib import Path
 import tkinter as tk
+from tkinter import messagebox
 import win32api
 import win32gui
 import win32con
+import win32process
 from pyvda import AppView, VirtualDesktop, get_virtual_desktops
+
+# Optional audio backend for the "music highlight" feature. Imported lazily so
+# the app still runs (feature simply stays off) if these packages are missing.
+try:
+    import psutil
+    from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+    _AUDIO_AVAILABLE = True
+except Exception:
+    _AUDIO_AVAILABLE = False
 
 APP_NAME = "Desktop Labeller"
 ICON_FILE = "desktop_labeller.ico"
@@ -32,11 +44,42 @@ PLACEHOLDER_SHORTCUT_ICON = "\U0001F517"  # link symbol
 # Optional per-workspace notification indicator (taskbar-flash "needs attention").
 DEFAULT_NOTIFICATION_INDICATOR = "\u25CF"  # filled circle
 DEFAULT_NOTIFICATION_COLOR = "#FF3333"
+# Optional per-workspace "music playing here" indicator (opt_feature_musichighlight).
+# A small monochrome music note (not the color speaker emoji) so it blends with
+# the overlay's minimal amber palette. It only appends a glyph and never changes
+# the label's text colour.
+DEFAULT_MUSIC_INDICATOR = "\u266A"  # eighth note ♪
+# How often the audio sessions are polled while the music feature is enabled.
+MUSIC_POLL_MS = 1000
+# Peak amplitude (0..1) above which an Active audio session counts as "playing";
+# ignores the near-silent noise floor of paused/idle sessions.
+MUSIC_PEAK_THRESHOLD = 0.0005
+# Poll cycles a desktop keeps its speaker after audio drops, so the glyph does
+# not flicker during brief silent gaps (e.g. between tracks).
+MUSIC_GRACE_CYCLES = 2
+# Optional countdown-timer component (opt_component_feature_timer).
+TIMER_POLL_MS = 1000               # how often the live countdown digits refresh
+TIMER_REMOVE_GLYPH = "\u2715"      # ✕ per-row remove button
+TIMER_ADD_LABEL = "ADD"
+TIMER_CLEAR_LABEL = "CLEAR"
+TIMER_EXPIRED_COLOR = "#FF3333"    # text colour once a timer hits 00:00:00
+DEFAULT_TIMER_DURATION = "00:05:00"  # pre-filled duration in the ADD dialog
+TIMER_FLASH_MS = 550               # blink interval for an expired-timer label
+TIMER_FLASH_FG = "#FFFFFF"         # text colour during the "on" flash phase
 LEGACY_LOCAL_CONFIG_FILE = Path("desktops.txt")
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 LEGACY_APPDATA_CONFIG_FILE = CONFIG_DIR / "desktops.txt"
 CONFIG_FILE = CONFIG_DIR / "desktops.json"
+# Countdown timers persist here so they keep counting (in real time) across
+# restarts, independent of the user-edited desktops.json config.
+TIMERS_FILE = CONFIG_DIR / "timers.json"
 STARTUP_VISIBLE_MS = 2500
+# Optional "hide while idle" feature (opt_feature_hide_when_idle): default
+# seconds of no keyboard/mouse input before the whole overlay is withdrawn.
+DEFAULT_IDLE_HIDE_SECONDS = 30.0
+# Poll cadence (ms) while the overlay is hidden for idle, so it reappears
+# promptly once the user touches the keyboard or mouse again.
+IDLE_HIDDEN_POLL_MS = 500
 TRAY_UID = 1
 WM_TRAYICON = win32con.WM_USER + 20
 # Custom message we post to the tray window (from any thread) to ask its
@@ -50,6 +93,34 @@ MENU_OPEN_CONFIG = 1001
 MENU_SHOW_OVERLAY = 1002
 MENU_EXIT = 1003
 
+
+class LASTINPUTINFO(ctypes.Structure):
+    """ctypes mirror of the Win32 LASTINPUTINFO struct for GetLastInputInfo."""
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def system_idle_seconds():
+    """Seconds since the last system-wide keyboard or mouse input.
+
+    Uses GetLastInputInfo, which reports the tick count of the most recent
+    input event across the whole session. Returns 0.0 on any failure so the
+    caller simply treats the user as active.
+    """
+    try:
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint
+        now = ctypes.windll.kernel32.GetTickCount()
+        # Both are unsigned 32-bit DWORDs; mask the difference so a GetTickCount
+        # wrap (~49.7 days of uptime) never yields a spurious negative idle.
+        elapsed_ms = (now - info.dwTime) & 0xFFFFFFFF
+        return elapsed_ms / 1000.0
+    except Exception:
+        return 0.0
+
+
 # Overlay Color Palette
 COLOR_BG = "#010101"
 # Near-black background that is NOT the -transparentcolor key, so the whole
@@ -61,6 +132,29 @@ COLOR_TEXT_ACTIVE = "#FFB300" # Muted gold for the active workspace highlight
 COLOR_ACTIVE_BG = "#221100"   # Extremely dark brown highlight box background
 COLOR_BAD_CONFIG = "#FF3333"
 COLOR_BAD_BG = "#220000"
+
+
+def blend_hex(fg, bg, opacity):
+    """Blends hex colour ``fg`` over ``bg`` at the given opacity (0.0-1.0).
+
+    Used to fake per-widget transparency: Tk's ``-alpha`` attribute only dims
+    the whole window, so the timer digits are instead composited toward their
+    own background to honour ``time_opacity`` without fading the rest of the
+    overlay. ``opacity`` 1.0 returns ``fg`` unchanged; 0.0 returns ``bg``.
+    """
+    try:
+        opacity = max(0.0, min(1.0, float(opacity)))
+    except (TypeError, ValueError):
+        return fg
+    if opacity >= 1.0:
+        return fg
+    fr, fg_, fb = int(fg[1:3], 16), int(fg[3:5], 16), int(fg[5:7], 16)
+    br, bg_, bb = int(bg[1:3], 16), int(bg[3:5], 16), int(bg[5:7], 16)
+    r = round(fr * opacity + br * (1.0 - opacity))
+    g = round(fg_ * opacity + bg_ * (1.0 - opacity))
+    b = round(fb * opacity + bb * (1.0 - opacity))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
 
 class OverlayPanel:
     """Per-monitor overlay window plus its own widget references."""
@@ -75,6 +169,7 @@ class OverlayPanel:
         self.size_scale = DEFAULT_SIZE_SCALE
         self.features = {}
         self.notification_settings = None
+        self.music_settings = None
         self.pin_labels = {
             "label_pin": DEFAULT_PIN_WINDOW_LABEL,
             "label_unpin": DEFAULT_UNPIN_WINDOW_LABEL,
@@ -87,14 +182,23 @@ class OverlayPanel:
         # when every label uses the panel's default font color.
         self.name_colors = {}
         self.marked_desktops = set()
+        self.music_marked = set()
         self.move_button = None
         self.pin_button = None
         self.highlighted_desktop_num = None
+        # Live toolbar clock label (opt_toolbar_feature_date_and_time), or None.
+        self.datetime_label = None
         self.shortcut_icons = []
         # Cached shortcut frame + config so the grid can be rebuilt on desktop
         # change when entries are filtered by the "workspaces" property.
         self.shortcuts_frame = None
         self.shortcuts_config = None
+        # Cached countdown-timer box frame + config (same rebuild pattern as the
+        # shortcut grid). timer_value_labels maps a timer id -> its live digits
+        # Label, so only those small widgets are reconfigured each second.
+        self.timer_frame = None
+        self.timer_config = None
+        self.timer_value_labels = {}
         self.hwnd = None
 
     def get_hwnd(self):
@@ -138,6 +242,25 @@ class WorkspaceOverlay:
         # config turns it on; the indicator/colour itself is per panel.
         self.notifications_enabled = False
         self.notified_desktops = set()
+        # Per-workspace "music playing" feature state. Enabled if ANY rendered
+        # config turns it on AND the audio backend imported successfully.
+        self.music_enabled = False
+        self.playing_desktops = set()
+        # desktop number -> remaining grace cycles (anti-flicker hysteresis).
+        self.music_grace = {}
+        # Countdown timers (opt_component_feature_timer), shared across panels
+        # and persisted to disk so they keep counting in real time. Each entry:
+        # {"id": int, "name": str, "end_epoch": float}.
+        self.timers = self.load_timers()
+        self.next_timer_id = (
+            max((t["id"] for t in self.timers), default=0) + 1
+        )
+        # Desktop numbers whose label is currently flashing because a timer
+        # expired; cleared per desktop when the user clicks that label. Global
+        # (survives panel rebuilds) and applied to every monitor's labels.
+        self.flashing_desktops = set()
+        self.flash_on = False
+        self.flash_after_id = None
         self.last_active_desktop = None
         self.wm_shellhook = None
         self.config_mtime = None
@@ -152,6 +275,15 @@ class WorkspaceOverlay:
         # True while the overlay is hidden because a fullscreen app (e.g. a
         # game) owns the screen; lets us avoid touching the window/compositor.
         self.hidden_for_fullscreen = False
+        # Optional "hide while idle" feature: when enabled the whole overlay is
+        # withdrawn after idle_hide_seconds of no input, and restored on the
+        # next keypress/mouse move. Enabled if ANY rendered config declares it.
+        self.idle_hide_enabled = False
+        self.idle_hide_seconds = DEFAULT_IDLE_HIDE_SECONDS
+        self.hidden_for_idle = False
+        # Tracks whether the panel windows are currently withdrawn, so the
+        # update loop only issues withdraw/deiconify on an actual state change.
+        self.windows_withdrawn = False
         self.tray_hwnd = None
         self.tray_wndclass = None
         self.tray_class_atom = None
@@ -186,6 +318,8 @@ class WorkspaceOverlay:
         # 3. Start monitoring active desktop state
         self.update_loop()
         self.track_desktop_loop()
+        self.music_loop()
+        self.timer_loop()
 
     def style_window(self, win):
         """Applies the borderless, transparent, top-most overlay styling."""
@@ -584,6 +718,14 @@ class WorkspaceOverlay:
                 label_unpin = DEFAULT_UNPIN_WINDOW_LABEL
             features["pinwindow"] = {"label_pin": label_pin, "label_unpin": label_unpin}
 
+        date_time = config.get("opt_toolbar_feature_date_and_time")
+        if date_time is not None and date_time is not False:
+            settings = date_time if isinstance(date_time, dict) else {}
+            # Optional text colour (hex string or RGBA list); falls back to the
+            # panel's font colour when missing or invalid.
+            color = self.parse_border_color(settings.get("color"))
+            features["datetime"] = {"color": color}
+
         shortcuts = config.get("opt_component_feature_shortcuts")
         if shortcuts is not None and shortcuts is not False:
             settings = shortcuts if isinstance(shortcuts, dict) else {}
@@ -665,6 +807,62 @@ class WorkspaceOverlay:
                 "color": color,
             }
 
+        music = config.get("opt_feature_musichighlight")
+        if music is not None and music is not False:
+            settings = music if isinstance(music, dict) else {}
+            indicator = settings.get("indicator", DEFAULT_MUSIC_INDICATOR)
+            if not isinstance(indicator, str) or not indicator.strip():
+                indicator = DEFAULT_MUSIC_INDICATOR
+            # No colour: the music state only appends a glyph and leaves the
+            # label's existing text colour untouched.
+            features["musichighlight"] = {
+                "indicator": indicator.strip(),
+            }
+
+        timer = config.get("opt_component_feature_timer")
+        if timer is not None and timer is not False:
+            settings = timer if isinstance(timer, dict) else {}
+            workspaces = self.parse_workspaces(settings.get("workspaces"))
+            # Pre-filled duration for the ADD dialog; falls back to the built-in
+            # default if the configured value is missing or not a valid time.
+            default_seconds = self.parse_duration(settings.get("default_new_time"))
+            default_new_time = (
+                self.format_duration(default_seconds)
+                if default_seconds is not None
+                else DEFAULT_TIMER_DURATION
+            )
+            raw_opacity = settings.get("time_opacity", 1.0)
+            try:
+                time_opacity = float(raw_opacity)
+                if not (0.0 <= time_opacity <= 1.0):
+                    time_opacity = 1.0
+            except (TypeError, ValueError):
+                time_opacity = 1.0
+            features["timer"] = {
+                "workspaces": workspaces,
+                "has_workspace_filter": workspaces is not None,
+                "default_new_time": default_new_time,
+                # Fraction 0.0–1.0 applied to the timer's countdown digits to
+                # reduce static pixel luminance on OLED displays. The digits are
+                # composited toward their background (see build_timer_row); the
+                # rest of the overlay is unaffected. 1.0 = fully opaque.
+                "time_opacity": time_opacity,
+            }
+
+        hide_idle = config.get("opt_feature_hide_when_idle")
+        if hide_idle is not None and hide_idle is not False:
+            settings = hide_idle if isinstance(hide_idle, dict) else {}
+            # Seconds of no input before the overlay hides. Must be positive;
+            # falls back to the default when missing or not a valid number.
+            raw_idle = settings.get("idle_seconds", DEFAULT_IDLE_HIDE_SECONDS)
+            try:
+                idle_seconds = float(raw_idle)
+                if idle_seconds <= 0:
+                    idle_seconds = DEFAULT_IDLE_HIDE_SECONDS
+            except (TypeError, ValueError):
+                idle_seconds = DEFAULT_IDLE_HIDE_SECONDS
+            features["hidewhenidle"] = {"idle_seconds": idle_seconds}
+
         return features
 
     def parse_border_width(self, value):
@@ -674,7 +872,14 @@ class WorkspaceOverlay:
         return value if value > 0 else 0
 
     def parse_border_color(self, value):
-        """Returns a hex border color from an RGBA list or hex string, else None."""
+        """Returns a hex color from an RGBA list/object or hex string, else None.
+
+        Accepts a hex string (``"#RRGGBB"``), an RGBA list (``[r, g, b, a]``),
+        or an RGBA object (``{"r": .., "g": .., "b": .., "a": ..}`` with
+        case-insensitive keys and an optional alpha).
+        """
+        if isinstance(value, dict):
+            value = self.rgba_object_to_list(value)
         if isinstance(value, list):
             try:
                 return self.rgba_to_hex(value)
@@ -683,6 +888,18 @@ class WorkspaceOverlay:
         if isinstance(value, str) and value.strip():
             return value.strip()
         return None
+
+    def rgba_object_to_list(self, value):
+        """Converts an ``{r, g, b, a}`` color object into an ``[r, g, b, a]``
+        list (alpha optional). Returns None when required channels are missing."""
+        lowered = {str(key).lower(): channel for key, channel in value.items()}
+        try:
+            rgba = [lowered["r"], lowered["g"], lowered["b"]]
+        except KeyError:
+            return None
+        if "a" in lowered:
+            rgba.append(lowered["a"])
+        return rgba
 
     def rgba_to_hex(self, rgba):
         if not isinstance(rgba, list) or len(rgba) not in (3, 4):
@@ -751,6 +968,31 @@ class WorkspaceOverlay:
             n for n in self.notified_desktops if 1 <= n <= total_desktops
         }
 
+        # Music highlight is tracked globally too, but only if the audio backend
+        # imported successfully; otherwise the feature stays silently disabled.
+        self.music_enabled = _AUDIO_AVAILABLE and any(
+            panel.config["features"].get("musichighlight") is not None
+            for panel in self.panels
+        )
+        if not self.music_enabled:
+            self.playing_desktops = set()
+            self.music_grace = {}
+
+        # Auto-hide while idle is global too: enabled if ANY rendered config
+        # declares it. When several configs set different thresholds, use the
+        # smallest so the overlay hides as soon as the strictest one wants.
+        idle_features = [
+            panel.config["features"]["hidewhenidle"]
+            for panel in self.panels
+            if panel.config["features"].get("hidewhenidle") is not None
+        ]
+        self.idle_hide_enabled = bool(idle_features)
+        self.idle_hide_seconds = (
+            min(feature["idle_seconds"] for feature in idle_features)
+            if idle_features
+            else DEFAULT_IDLE_HIDE_SECONDS
+        )
+
         # Reset global toolbar state, then render each panel from its config.
         self.move_mode = False
         self.move_selected_hwnd = None
@@ -774,11 +1016,20 @@ class WorkspaceOverlay:
         panel.size_scale = config["size_scale"]
         panel.features = config["features"]
         panel.notification_settings = config["features"].get("notifications")
+        panel.music_settings = config["features"].get("musichighlight")
         self.workspace_font_color = panel.font_color
         self.workspace_surface_color = panel.surface_color
         self.workspace_size_scale = panel.size_scale
 
         win = panel.win
+        # Keep this panel's window fully opaque. time_opacity is applied only
+        # to the timer's countdown digits (see build_timer_row), not the whole
+        # window, so the rest of the overlay is never dimmed.
+        try:
+            win.attributes("-alpha", 1.0)
+        except Exception:
+            pass
+
         # Clear existing widgets before rebuilding the config button and labels.
         # Secondary monitor windows are Tk children of the root, so skip any
         # Toplevel here to avoid destroying the other panels.
@@ -790,11 +1041,16 @@ class WorkspaceOverlay:
         panel.label_base_text.clear()
         panel.name_colors = {}
         panel.marked_desktops = set()
+        panel.music_marked = set()
         panel.move_button = None
         panel.pin_button = None
+        panel.datetime_label = None
         panel.shortcut_icons = []
         panel.shortcuts_frame = None
         panel.shortcuts_config = None
+        panel.timer_frame = None
+        panel.timer_config = None
+        panel.timer_value_labels = {}
         # Force the update loop to repaint the active-desktop highlight after a
         # full rebuild, since all label widgets were just recreated.
         panel.highlighted_desktop_num = None
@@ -854,7 +1110,7 @@ class WorkspaceOverlay:
             lbl.pack(side="left", padx=self.scaled_size(2))
 
             # Bind the mouse click event directly to Windows desktop switching API
-            lbl.bind("<Button-1>", lambda event, num=idx: self.switch_desktop(num))
+            lbl.bind("<Button-1>", lambda event, num=idx: self.on_label_click(num))
             panel.label_widgets[idx] = lbl
             panel.label_base_text[idx] = text
 
@@ -863,10 +1119,17 @@ class WorkspaceOverlay:
         # Optional shortcut launcher grid.
         if "shortcuts" in config["features"]:
             self.build_shortcuts(panel, config["features"]["shortcuts"])
+        # Optional countdown-timer box.
+        if "timer" in config["features"]:
+            self.build_timer(panel, config["features"]["timer"])
 
     def build_toolbar(self, panel, features):
         """Builds the optional feature toolbar underneath the workspace list."""
-        if "movewindow" not in features and "pinwindow" not in features:
+        if (
+            "movewindow" not in features
+            and "pinwindow" not in features
+            and "datetime" not in features
+        ):
             return
 
         toolbar = tk.Frame(panel.win, bg=COLOR_BG)
@@ -903,6 +1166,38 @@ class WorkspaceOverlay:
             pin_btn.pack(side="left", padx=self.scaled_size(2))
             pin_btn.bind("<Button-1>", lambda event: self.toggle_pin_window())
             panel.pin_button = pin_btn
+
+        if "datetime" in features:
+            color = features["datetime"].get("color") or self.workspace_font_color
+            datetime_lbl = tk.Label(
+                toolbar,
+                text=f" {self.format_datetime()} ",
+                font=("Segoe UI", self.scaled_size(11), "bold"),
+                bg=COLOR_HIT_BG,
+                fg=color,
+                padx=self.scaled_size(8),
+                pady=self.scaled_size(4),
+            )
+            datetime_lbl.pack(side="left", padx=self.scaled_size(2))
+            panel.datetime_label = datetime_lbl
+
+    def format_datetime(self):
+        """Returns the current local date/time as e.g. 'Jun 5 - 23:23'."""
+        lt = time.localtime()
+        return f"{time.strftime('%b', lt)} {lt.tm_mday} - {time.strftime('%H:%M', lt)}"
+
+    def refresh_datetime_labels(self):
+        """Updates the live toolbar clock on every panel that shows it."""
+        text = f" {self.format_datetime()} "
+        for panel in self.panels:
+            label = panel.datetime_label
+            if label is None:
+                continue
+            if label.cget("text") != text:
+                try:
+                    label.configure(text=text)
+                except Exception:
+                    pass
 
     def set_move_mode(self, enabled):
         """Arms/disarms move-window mode and refreshes every toolbar button."""
@@ -1132,6 +1427,470 @@ class WorkspaceOverlay:
             )
         except Exception:
             pass
+
+    # ----- Countdown timer component (opt_component_feature_timer) -----------
+
+    def load_timers(self):
+        """Loads persisted countdown timers, dropping any already long expired."""
+        try:
+            with open(TIMERS_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return []
+        timers = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                end_epoch = item.get("end_epoch")
+                tid = item.get("id")
+                if not isinstance(name, str):
+                    continue
+                if not isinstance(end_epoch, (int, float)):
+                    continue
+                if not isinstance(tid, int):
+                    tid = len(timers) + 1
+                workspace = item.get("workspace")
+                if not isinstance(workspace, int):
+                    workspace = None
+                timers.append(
+                    {
+                        "id": tid,
+                        "name": name,
+                        "end_epoch": float(end_epoch),
+                        # Desktop number the timer was created on; only this
+                        # workspace's label flashes when the timer expires.
+                        "workspace": workspace,
+                        # Whether this timer's expiry has already triggered its
+                        # flash, so it does not re-flash every poll or restart.
+                        "notified": bool(item.get("notified", False)),
+                    }
+                )
+        return timers
+
+    def save_timers(self):
+        """Persists the current timers so they survive an app restart."""
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(TIMERS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(self.timers, handle, indent=2)
+        except Exception:
+            pass
+
+    def parse_duration(self, text):
+        """Parses 'HH:MM:SS' / 'MM:SS' / 'SS' into seconds, or None if invalid."""
+        if not isinstance(text, str):
+            return None
+        text = text.strip()
+        if not text:
+            return None
+        parts = text.split(":")
+        if len(parts) > 3:
+            return None
+        try:
+            nums = [int(part) for part in parts]
+        except ValueError:
+            return None
+        if any(num < 0 for num in nums):
+            return None
+        while len(nums) < 3:
+            nums.insert(0, 0)
+        hours, minutes, seconds = nums
+        total = hours * 3600 + minutes * 60 + seconds
+        return total if total > 0 else None
+
+    def format_duration(self, seconds):
+        """Formats a (clamped non-negative) second count as HH:MM:SS."""
+        seconds = max(0, int(seconds))
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def timer_remaining(self, timer):
+        """Whole seconds left on a timer (never negative)."""
+        return max(0, int(round(timer["end_epoch"] - time.time())))
+
+    def rebuild_panel_timer(self, panel):
+        """Rebuilds just this panel's timer box for the current desktop."""
+        if panel.timer_config is None:
+            return
+        self.workspace_font_color = panel.font_color
+        self.workspace_surface_color = panel.surface_color
+        self.workspace_size_scale = panel.size_scale
+        self.build_timer(panel, panel.timer_config)
+
+    def rebuild_timers(self):
+        """Rebuilds the timer box on every panel that enables the feature.
+
+        Used after a timer is added, removed, or cleared so all monitors stay
+        in sync. Restores each panel's build context before rebuilding.
+        """
+        for panel in self.panels:
+            if panel.timer_config is None:
+                continue
+            self.rebuild_panel_timer(panel)
+
+    def build_timer(self, panel, timer):
+        """Builds the optional countdown-timer box under the toolbar/shortcuts.
+
+        The box is only shown when the feature's optional ``workspaces`` filter
+        matches the active desktop (same semantics as the shortcut filter). The
+        cached config lets the box be rebuilt cheaply on a desktop change or
+        when the timer list is mutated.
+        """
+        panel.timer_value_labels = {}
+        panel.timer_config = timer
+
+        # Drop a previously built box (used when rebuilding).
+        if panel.timer_frame is not None:
+            try:
+                panel.timer_frame.destroy()
+            except Exception:
+                pass
+            panel.timer_frame = None
+
+        current_desktop = self.last_active_desktop
+        workspaces = timer.get("workspaces")
+        if workspaces is not None and (
+            current_desktop is None or current_desktop not in workspaces
+        ):
+            return
+
+        font_color = self.workspace_font_color
+
+        # Opaque (non-keyed) background so the layered window does not wiggle.
+        box = tk.Frame(panel.win, bg=COLOR_HIT_BG)
+        box.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
+        box.configure(
+            highlightthickness=self.scaled_size(1),
+            highlightbackground=font_color,
+            highlightcolor=font_color,
+        )
+        panel.timer_frame = box
+
+        # Left: the list of timer rows. Right: ADD / CLEAR buttons.
+        rows = tk.Frame(box, bg=COLOR_HIT_BG)
+        rows.pack(side="left", anchor="n", padx=self.scaled_size(2), pady=self.scaled_size(2))
+
+        if not self.timers:
+            tk.Label(
+                rows,
+                text=" no timers ",
+                font=("Consolas", self.scaled_size(11)),
+                bg=COLOR_HIT_BG,
+                fg=font_color,
+                padx=self.scaled_size(6),
+                pady=self.scaled_size(4),
+            ).pack(side="top", anchor="w")
+        else:
+            for timer_entry in self.timers:
+                self.build_timer_row(panel, rows, timer_entry, font_color)
+
+        # Vertical divider between the list and the action buttons.
+        tk.Frame(box, bg=font_color, width=self.scaled_size(1)).pack(
+            side="left", fill="y", pady=self.scaled_size(2)
+        )
+
+        buttons = tk.Frame(box, bg=COLOR_HIT_BG)
+        buttons.pack(side="left", anchor="n", padx=self.scaled_size(2), pady=self.scaled_size(2))
+
+        add_btn = tk.Label(
+            buttons,
+            text=f" {TIMER_ADD_LABEL} ",
+            font=("Segoe UI", self.scaled_size(11), "bold"),
+            bg=COLOR_HIT_BG,
+            fg=font_color,
+            padx=self.scaled_size(8),
+            pady=self.scaled_size(4),
+            cursor="hand2",
+        )
+        add_btn.pack(side="top", fill="x")
+        add_btn.bind("<Button-1>", lambda event, p=panel: self.prompt_add_timer(p))
+
+        tk.Frame(buttons, bg=font_color, height=self.scaled_size(1)).pack(
+            side="top", fill="x", pady=self.scaled_size(2)
+        )
+
+        clear_btn = tk.Label(
+            buttons,
+            text=f" {TIMER_CLEAR_LABEL} ",
+            font=("Segoe UI", self.scaled_size(11), "bold"),
+            bg=COLOR_HIT_BG,
+            fg=font_color,
+            padx=self.scaled_size(8),
+            pady=self.scaled_size(4),
+            cursor="hand2",
+        )
+        clear_btn.pack(side="top", fill="x")
+        clear_btn.bind("<Button-1>", lambda event, p=panel: self.prompt_clear_timers(p))
+
+    def build_timer_row(self, panel, parent, timer_entry, font_color):
+        """Builds one '[ws] name HH:MM:SS [x]' row inside the timer box."""
+        remaining = self.timer_remaining(timer_entry)
+        expired = remaining <= 0
+        # Dim only the countdown digits toward their background per time_opacity
+        # (OLED protection), leaving the name/buttons at full intensity.
+        opacity = (panel.timer_config or {}).get("time_opacity", 1.0)
+        base_color = TIMER_EXPIRED_COLOR if expired else COLOR_TEXT_ACTIVE
+        value_color = blend_hex(base_color, COLOR_HIT_BG, opacity)
+
+        row = tk.Frame(parent, bg=COLOR_HIT_BG)
+        row.pack(side="top", anchor="w")
+
+        # Prefix the name with the desktop number the timer was set on.
+        workspace = timer_entry.get("workspace")
+        prefix = f"[{workspace}] " if workspace else ""
+        tk.Label(
+            row,
+            text=f" {prefix}{timer_entry['name']} ",
+            font=("Consolas", self.scaled_size(11), "bold"),
+            bg=COLOR_HIT_BG,
+            fg=font_color,
+            padx=self.scaled_size(4),
+            pady=self.scaled_size(3),
+        ).pack(side="left")
+
+        value_lbl = tk.Label(
+            row,
+            text=f" {self.format_duration(remaining)} ",
+            font=("Consolas", self.scaled_size(11), "bold"),
+            bg=COLOR_HIT_BG,
+            fg=value_color,
+            padx=self.scaled_size(4),
+            pady=self.scaled_size(3),
+        )
+        value_lbl.pack(side="left")
+        panel.timer_value_labels[timer_entry["id"]] = value_lbl
+
+        remove_btn = tk.Label(
+            row,
+            text=f" {TIMER_REMOVE_GLYPH} ",
+            font=("Segoe UI", self.scaled_size(11), "bold"),
+            bg=COLOR_HIT_BG,
+            fg=font_color,
+            padx=self.scaled_size(4),
+            pady=self.scaled_size(3),
+            cursor="hand2",
+        )
+        remove_btn.pack(side="left")
+        remove_btn.bind(
+            "<Button-1>", lambda event, tid=timer_entry["id"]: self.remove_timer(tid)
+        )
+
+    def refresh_timer_values(self):
+        """Updates the live countdown digits on every visible timer box.
+
+        Only the small value labels that actually changed are reconfigured, so
+        a paused/expired timer (steady 00:00:00) costs nothing and the layered
+        window only recomposites the digits that ticked.
+        """
+        for panel in self.panels:
+            if not panel.timer_value_labels:
+                continue
+            opacity = (panel.timer_config or {}).get("time_opacity", 1.0)
+            for timer_entry in self.timers:
+                value_lbl = panel.timer_value_labels.get(timer_entry["id"])
+                if value_lbl is None:
+                    continue
+                remaining = self.timer_remaining(timer_entry)
+                new_text = f" {self.format_duration(remaining)} "
+                base_color = (
+                    TIMER_EXPIRED_COLOR if remaining <= 0 else COLOR_TEXT_ACTIVE
+                )
+                new_color = blend_hex(base_color, COLOR_HIT_BG, opacity)
+                if value_lbl.cget("text") != new_text or value_lbl.cget("fg") != new_color:
+                    try:
+                        value_lbl.configure(text=new_text, fg=new_color)
+                    except Exception:
+                        pass
+
+    def timer_loop(self):
+        """1 Hz refresh of the live countdown digits while a box is visible."""
+        try:
+            if not self.overlay_hidden:
+                self.check_timer_expiry()
+                self.refresh_timer_values()
+                self.refresh_datetime_labels()
+        except Exception:
+            pass
+        self.root.after(TIMER_POLL_MS, self.timer_loop)
+
+    def check_timer_expiry(self):
+        """Starts the label flash when a timer newly reaches 00:00:00.
+
+        Only the workspace the timer was created on flashes, so an expiry alerts
+        you exactly where the timer was set.
+        """
+        newly_expired = False
+        for timer in self.timers:
+            if self.timer_remaining(timer) <= 0 and not timer.get("notified"):
+                timer["notified"] = True
+                newly_expired = True
+                workspace = timer.get("workspace")
+                if workspace:
+                    self.flashing_desktops.add(workspace)
+        if newly_expired:
+            self.save_timers()
+            self.start_flashing()
+
+    def start_flashing(self):
+        """Begins the flash loop if it is not already running."""
+        if self.flash_after_id is None and self.flashing_desktops:
+            self.flash_on = False
+            self.flash_loop()
+
+    def flash_loop(self):
+        """Toggles the flashing labels between normal and an alert highlight."""
+        if not self.flashing_desktops:
+            self.flash_after_id = None
+            self.flash_on = False
+            return
+        self.flash_on = not self.flash_on
+        for panel in self.panels:
+            for idx in self.flashing_desktops:
+                if idx in panel.label_widgets:
+                    self.style_label(panel, idx)
+        self.flash_after_id = self.root.after(TIMER_FLASH_MS, self.flash_loop)
+
+    def acknowledge_flash(self, desktop_num):
+        """Stops flashing once the user clicks a flashing label.
+
+        Any click on a flashing label acknowledges the expired-timer alert and
+        stops the flashing everywhere, even when that desktop is already active.
+        """
+        if desktop_num not in self.flashing_desktops:
+            return
+        self.stop_flashing()
+
+    def stop_flashing(self):
+        """Clears all flashing labels and repaints them to their normal style."""
+        if not self.flashing_desktops:
+            return
+        cleared = self.flashing_desktops
+        self.flashing_desktops = set()
+        self.flash_on = False
+        for panel in self.panels:
+            for idx in cleared:
+                if idx in panel.label_widgets:
+                    self.style_label(panel, idx)
+
+    def on_label_click(self, desktop_num):
+        """Handles a workspace-label click: acknowledge any flash, then switch."""
+        self.acknowledge_flash(desktop_num)
+        self.switch_desktop(desktop_num)
+    def prompt_add_timer(self, panel):
+        """Opens a small modal asking for a timer name and duration, then adds it."""
+        default_time = DEFAULT_TIMER_DURATION
+        if panel.timer_config is not None:
+            default_time = panel.timer_config.get("default_new_time", default_time)
+        result = self.ask_timer_details(panel.win, default_time)
+        if result is None:
+            return
+        name, seconds = result
+        timer_entry = {
+            "id": self.next_timer_id,
+            "name": name,
+            "end_epoch": time.time() + seconds,
+            "workspace": self.last_active_desktop,
+            "notified": False,
+        }
+        self.next_timer_id += 1
+        self.timers.append(timer_entry)
+        self.save_timers()
+        self.rebuild_timers()
+
+    def ask_timer_details(self, parent, default_time=DEFAULT_TIMER_DURATION):
+        """Modal dialog returning (name, seconds) or None if cancelled/invalid."""
+        dialog = tk.Toplevel(parent)
+        dialog.title("Add timer")
+        dialog.configure(bg=COLOR_HIT_BG)
+        dialog.resizable(False, False)
+        dialog.attributes("-topmost", True)
+
+        result = {"value": None}
+
+        tk.Label(
+            dialog, text="Name:", bg=COLOR_HIT_BG, fg=COLOR_TEXT_ACTIVE,
+            font=("Segoe UI", 10),
+        ).grid(row=0, column=0, sticky="e", padx=8, pady=(10, 4))
+        name_var = tk.StringVar()
+        name_entry = tk.Entry(dialog, textvariable=name_var, width=22)
+        name_entry.grid(row=0, column=1, padx=8, pady=(10, 4))
+
+        tk.Label(
+            dialog, text="Duration (HH:MM:SS):", bg=COLOR_HIT_BG,
+            fg=COLOR_TEXT_ACTIVE, font=("Segoe UI", 10),
+        ).grid(row=1, column=0, sticky="e", padx=8, pady=4)
+        dur_var = tk.StringVar(value=default_time)
+        dur_entry = tk.Entry(dialog, textvariable=dur_var, width=22)
+        dur_entry.grid(row=1, column=1, padx=8, pady=4)
+
+        error_var = tk.StringVar()
+        error_lbl = tk.Label(
+            dialog, textvariable=error_var, bg=COLOR_HIT_BG, fg=TIMER_EXPIRED_COLOR,
+            font=("Segoe UI", 9),
+        )
+        error_lbl.grid(row=2, column=0, columnspan=2, padx=8)
+
+        def submit():
+            seconds = self.parse_duration(dur_var.get())
+            if seconds is None:
+                error_var.set("Enter a positive duration like 00:05:00")
+                return
+            name = name_var.get().strip() or "Timer"
+            result["value"] = (name, seconds)
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        btn_row = tk.Frame(dialog, bg=COLOR_HIT_BG)
+        btn_row.grid(row=3, column=0, columnspan=2, pady=(6, 10))
+        tk.Button(btn_row, text="Add", width=8, command=submit).pack(
+            side="left", padx=6
+        )
+        tk.Button(btn_row, text="Cancel", width=8, command=cancel).pack(
+            side="left", padx=6
+        )
+
+        dialog.bind("<Return>", lambda event: submit())
+        dialog.bind("<Escape>", lambda event: cancel())
+
+        name_entry.focus_set()
+        dialog.update_idletasks()
+        dialog.grab_set()
+        parent.wait_window(dialog)
+        return result["value"]
+
+    def remove_timer(self, timer_id):
+        """Removes a single timer by id, then rebuilds the boxes."""
+        before = len(self.timers)
+        self.timers = [t for t in self.timers if t["id"] != timer_id]
+        if len(self.timers) != before:
+            self.save_timers()
+            if not self.timers:
+                self.stop_flashing()
+            self.rebuild_timers()
+
+    def prompt_clear_timers(self, panel):
+        """Asks for confirmation, then removes all timers."""
+        if not self.timers:
+            return
+        try:
+            confirmed = messagebox.askyesno(
+                "Clear timers",
+                "Remove all timers?",
+                parent=panel.win,
+            )
+        except Exception:
+            confirmed = False
+        if confirmed:
+            self.timers = []
+            self.save_timers()
+            self.stop_flashing()
+            self.rebuild_timers()
 
     def get_tracked_window(self):
         """Returns the last external (non-overlay) foreground window handle.
@@ -1483,20 +2242,36 @@ class WorkspaceOverlay:
             self.set_move_mode(False)
 
     def style_label(self, panel, idx):
-        """Renders one workspace label from active-highlight + notification state."""
+        """Renders one workspace label from active-highlight, notification and
+        music-playing state."""
         lbl = panel.label_widgets.get(idx)
         if lbl is None:
             return
         base = panel.label_base_text.get(idx, lbl.cget("text"))
         is_active = idx == panel.highlighted_desktop_num
         notified = panel.notification_settings is not None and idx in self.notified_desktops
+        playing = panel.music_settings is not None and idx in self.playing_desktops
         bg = COLOR_ACTIVE_BG if is_active else panel.surface_color
+        # The notification state recolours the whole label; the music state only
+        # appends a glyph and never changes the label's text colour.
         if notified:
             fg = panel.notification_settings["color"]
-            text = f" {base.strip()} {panel.notification_settings['indicator']} "
         else:
             fg = panel.name_colors.get(idx) or panel.font_color
+        suffix = ""
+        if notified:
+            suffix += " " + panel.notification_settings["indicator"]
+        if playing:
+            suffix += " " + panel.music_settings["indicator"]
+        if suffix:
+            text = f" {base.strip()}{suffix} "
+        else:
             text = base
+        # An expired-timer label flashes: during the "on" phase it overrides the
+        # colours with a bright alert highlight; the "off" phase shows normal.
+        if idx in self.flashing_desktops and self.flash_on:
+            fg = TIMER_FLASH_FG
+            bg = TIMER_EXPIRED_COLOR
         lbl.config(fg=fg, bg=bg, text=text)
 
     def refresh_notifications(self):
@@ -1511,6 +2286,135 @@ class WorkspaceOverlay:
             for idx in want ^ panel.marked_desktops:
                 self.style_label(panel, idx)
             panel.marked_desktops = want
+
+    def refresh_music(self):
+        """Repaints labels whose music-playing state changed (per panel)."""
+        if not self.music_enabled:
+            return
+        for panel in self.panels:
+            if panel.music_settings is None:
+                continue
+            valid = set(panel.label_widgets.keys())
+            want = self.playing_desktops & valid
+            for idx in want ^ panel.music_marked:
+                self.style_label(panel, idx)
+            panel.music_marked = want
+
+    def music_loop(self):
+        """Polls audio sessions and flags desktops whose app is playing sound.
+
+        Runs only while the feature is enabled; otherwise it is a cheap 1 Hz
+        heartbeat that re-arms itself so a config reload can turn it back on.
+        """
+        try:
+            if (
+                self.music_enabled
+                and not self.overlay_hidden
+                and self.panels
+            ):
+                current = self.detect_playing_desktops()
+                # Anti-flicker hysteresis: refresh grace for live desktops,
+                # decay the rest so the speaker lingers through short gaps.
+                for desktop in current:
+                    self.music_grace[desktop] = MUSIC_GRACE_CYCLES
+                for desktop in list(self.music_grace.keys()):
+                    if desktop not in current:
+                        self.music_grace[desktop] -= 1
+                        if self.music_grace[desktop] <= 0:
+                            del self.music_grace[desktop]
+                playing = set(self.music_grace.keys())
+                if playing != self.playing_desktops:
+                    self.playing_desktops = playing
+                    self.refresh_music()
+        except Exception:
+            pass
+        self.root.after(MUSIC_POLL_MS, self.music_loop)
+
+    def detect_playing_desktops(self):
+        """Set of virtual-desktop numbers whose owning app is emitting audio."""
+        if not _AUDIO_AVAILABLE:
+            return set()
+        try:
+            sessions = AudioUtilities.GetAllSessions()
+        except Exception:
+            return set()
+        playing_pids = set()
+        for session in sessions:
+            process = session.Process
+            if not process:
+                continue
+            try:
+                if session._ctl.GetState() != 1:  # not AudioSessionStateActive
+                    continue
+                meter = session._ctl.QueryInterface(IAudioMeterInformation)
+                if meter.GetPeakValue() <= MUSIC_PEAK_THRESHOLD:
+                    continue
+            except Exception:
+                continue
+            playing_pids.add(process.pid)
+        if not playing_pids:
+            return set()
+
+        # One enumeration pass: top-level visible windows grouped by owning PID.
+        # EnumWindows yields windows in z-order (topmost first), so each PID's
+        # list is ordered most-recently-active first.
+        pid_windows = {}
+
+        def collect(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if not win32gui.GetWindowText(hwnd):
+                return True
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                return True
+            pid_windows.setdefault(pid, []).append(hwnd)
+            return True
+
+        try:
+            win32gui.EnumWindows(collect, None)
+        except Exception:
+            return set()
+
+        desktops = set()
+        for pid in playing_pids:
+            # The audio session often belongs to a windowless child (e.g. a
+            # browser's audio process); walk up to the nearest ancestor that
+            # actually owns visible windows.
+            for ancestor in self.ancestor_pids(pid):
+                hwnds = pid_windows.get(ancestor)
+                if not hwnds:
+                    continue
+                # An app with windows on several desktops (e.g. a browser whose
+                # tabs are spread out) routes all audio through one process, and
+                # Windows does not say which window is the source. Mark only the
+                # topmost (most-recently-active) window's desktop, the best
+                # single guess for where the audio actually plays.
+                for hwnd in hwnds:
+                    number = self.window_desktop_number(hwnd)
+                    if number:
+                        desktops.add(number)
+                        break
+                break
+        return desktops
+
+    def ancestor_pids(self, pid):
+        """PID and its parent chain (self first), for window-owner lookup."""
+        chain = [pid]
+        if not _AUDIO_AVAILABLE:
+            return chain
+        try:
+            proc = psutil.Process(pid)
+            for _ in range(6):  # bounded walk; avoid pathological loops
+                parent = proc.parent()
+                if parent is None:
+                    break
+                chain.append(parent.pid)
+                proc = parent
+        except Exception:
+            pass
+        return chain
 
     def window_desktop_number(self, hwnd):
         """Virtual desktop number a window lives on, or None if it can't map."""
@@ -1573,6 +2477,11 @@ class WorkspaceOverlay:
             except Exception:
                 pass
         self.apply_window_styles()
+
+    @property
+    def overlay_hidden(self):
+        """True while the panels are withdrawn (fullscreen app or user idle)."""
+        return self.hidden_for_fullscreen or self.hidden_for_idle
 
     def schedule_background_mode(self):
         """(Re)arm the timer that returns the overlay to the background.
@@ -1651,11 +2560,20 @@ class WorkspaceOverlay:
             # Rebuild the shortcut grid only when entries are scoped to specific
             # desktops, so the visible set tracks the active desktop. Runs on a
             # real switch, not per tick, so it does not trigger the "wiggle".
+            shortcuts_rebuilt = False
             if (
                 panel.shortcuts_config is not None
                 and panel.shortcuts_config.get("has_workspace_filter")
             ):
                 self.rebuild_panel_shortcuts(panel)
+                shortcuts_rebuilt = True
+            # Rebuild the timer box when it is desktop-scoped, or whenever the
+            # shortcut grid above it was just rebuilt (so the timer box, which
+            # packs last, stays below the shortcuts).
+            if panel.timer_config is not None and (
+                shortcuts_rebuilt or panel.timer_config.get("has_workspace_filter")
+            ):
+                self.rebuild_panel_timer(panel)
 
     def poll_active_desktop(self):
         """Reads the current desktop number and repaints the highlight if moved.
@@ -1663,7 +2581,7 @@ class WorkspaceOverlay:
         Shared by the fast backstop poll and the event-driven activation path.
         Cheap: a single COM read plus a guarded (no-op unless changed) repaint.
         """
-        if self.hidden_for_fullscreen or not self.panels:
+        if self.overlay_hidden or not self.panels:
             return
         try:
             current_desktop_num = VirtualDesktop.current().number
@@ -1688,22 +2606,38 @@ class WorkspaceOverlay:
     def update_loop(self):
         next_delay = 400
         try:
-            if self.is_fullscreen_app_foreground():
-                # A fullscreen app owns the screen. Hide the overlay and stop
-                # the periodic SetWindowPos churn so we cannot affect the
-                # game/compositor, and poll less often to stay effectively
-                # idle until the user returns to the desktop.
-                if not self.hidden_for_fullscreen:
-                    self.hidden_for_fullscreen = True
+            # Decide whether the overlay should be hidden this tick, and why.
+            # A fullscreen app takes priority; otherwise hide once the user has
+            # been idle past the configured threshold (when the feature is on).
+            fullscreen = self.is_fullscreen_app_foreground()
+            idle = (
+                not fullscreen
+                and self.idle_hide_enabled
+                and system_idle_seconds() >= self.idle_hide_seconds
+            )
+            self.hidden_for_fullscreen = fullscreen
+            self.hidden_for_idle = idle
+
+            if fullscreen or idle:
+                # Hide the overlay and stop the periodic SetWindowPos churn so
+                # we cannot affect the game/compositor, and poll less often to
+                # stay effectively idle until the user returns.
+                if not self.windows_withdrawn:
+                    self.windows_withdrawn = True
                     for panel in self.panels:
                         try:
                             panel.win.withdraw()
                         except Exception:
                             pass
-                next_delay = 1000
+                # Fullscreen can poll slowly; idle polls a bit faster so the
+                # overlay snaps back promptly when the user returns.
+                next_delay = 1000 if fullscreen else IDLE_HIDDEN_POLL_MS
             else:
-                if self.hidden_for_fullscreen:
-                    self.hidden_for_fullscreen = False
+                if self.windows_withdrawn:
+                    self.windows_withdrawn = False
+                    # Re-assert background z-order on the first tick after
+                    # showing, so the restored windows drop behind apps again.
+                    self.last_foreground_hwnd = None
                     for panel in self.panels:
                         try:
                             panel.win.deiconify()
