@@ -8,6 +8,7 @@ import ctypes
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import font as tkfont
 import win32api
 import win32gui
 import win32con
@@ -60,6 +61,13 @@ MUSIC_GRACE_CYCLES = 2
 # Optional countdown-timer component (opt_component_feature_timer).
 TIMER_POLL_MS = 1000               # how often the live countdown digits refresh
 TIMER_REMOVE_GLYPH = "\u2715"      # ✕ per-row remove button
+# Per-row media-control icons drawn in the Segoe MDL2 Assets symbol font
+# (shipped on Windows 10/11), whose private-use codepoints are proper media
+# glyphs rather than text characters that fall back to tofu boxes.
+TIMER_ICON_FONT = "Segoe MDL2 Assets"
+TIMER_PAUSE_GLYPH = "\uE769"       # Pause (running timer)
+TIMER_RESUME_GLYPH = "\uE768"      # Play / resume (paused timer)
+TIMER_RESTART_GLYPH = "\uE72C"     # Refresh / restart to full duration
 TIMER_ADD_LABEL = "ADD"
 TIMER_CLEAR_LABEL = "CLEAR"
 TIMER_EXPIRED_COLOR = "#FF3333"    # text colour once a timer hits 00:00:00
@@ -188,6 +196,7 @@ class OverlayPanel:
         self.highlighted_desktop_num = None
         # Live toolbar clock label (opt_toolbar_feature_date_and_time), or None.
         self.datetime_label = None
+        self.toolbar_frame = None
         self.shortcut_icons = []
         # Cached shortcut frame + config so the grid can be rebuilt on desktop
         # change when entries are filtered by the "workspaces" property.
@@ -1045,6 +1054,7 @@ class WorkspaceOverlay:
         panel.move_button = None
         panel.pin_button = None
         panel.datetime_label = None
+        panel.toolbar_frame = None
         panel.shortcut_icons = []
         panel.shortcuts_frame = None
         panel.shortcuts_config = None
@@ -1055,12 +1065,35 @@ class WorkspaceOverlay:
         # full rebuild, since all label widgets were just recreated.
         panel.highlighted_desktop_num = None
 
-        # Row holding the gear button and the workspace labels.
+        # Vertical container of one or more horizontal rows. The gear button
+        # and the workspace labels flow left-to-right and wrap onto additional
+        # rows so the window never grows wider than the monitor.
+        #
+        # This is critical, not cosmetic: a layered -transparentcolor window
+        # that overflows its monitor (or spills onto an adjacent monitor) fails
+        # to composite its lower rows, so the toolbar/shortcut/timer boxes
+        # silently vanish on the next recomposite (e.g. the HWND_BOTTOM
+        # re-assert when the overlay drops to the background). Keeping the
+        # window within the monitor bounds is what keeps those rows visible.
         list_frame = tk.Frame(win, bg=COLOR_BG)
         list_frame.pack(side="top", anchor="w")
 
+        # Usable width for this monitor; fall back to the primary screen width
+        # when the monitor rect is unknown.
+        if panel.monitor_rect:
+            max_row_width = panel.monitor_rect[2] - panel.monitor_rect[0]
+        else:
+            max_row_width = self.root.winfo_screenwidth()
+        # Leave a small margin so the window never quite reaches the edge.
+        max_row_width = max(1, max_row_width - self.scaled_size(8))
+
+        gap = self.scaled_size(2)
+        row = tk.Frame(list_frame, bg=COLOR_BG)
+        row.pack(side="top", anchor="w")
+        row_width = 0
+
         config_lbl = tk.Label(
-            list_frame,
+            row,
             text=" ⚙ CONFIG ",
             font=("Segoe UI", self.scaled_size(12), "bold"),
             bg=COLOR_BAD_BG if config["bad_format"] else COLOR_ACTIVE_BG,
@@ -1071,10 +1104,21 @@ class WorkspaceOverlay:
         )
         config_lbl.pack(side="left", padx=(0, self.scaled_size(6)))
         config_lbl.bind("<Button-1>", lambda event: self.open_config())
+        # Measure widths from font metrics rather than winfo_reqwidth(), which
+        # returns 1 for freshly-created widgets until an idle pass runs.
+        cfg_font = tkfont.Font(
+            family="Segoe UI", size=self.scaled_size(12), weight="bold"
+        )
+        row_width += (
+            cfg_font.measure(" ⚙ CONFIG ")
+            + self.scaled_size(8) * 2
+            + 4
+            + self.scaled_size(6)
+        )
 
         if config["bad_format"]:
             bad_config_lbl = tk.Label(
-                list_frame,
+                row,
                 text=" JSON: Bad format ",
                 font=("Consolas", self.scaled_size(11), "bold"),
                 bg=COLOR_BG,
@@ -1095,24 +1139,36 @@ class WorkspaceOverlay:
             if idx - 1 < len(config_colors) and config_colors[idx - 1]
         }
 
-        # Grid/Pack them horizontally (change to side="top" if you prefer vertical stack)
+        ws_font = tkfont.Font(
+            family="Consolas", size=self.scaled_size(11), weight="bold"
+        )
+        label_pad = self.scaled_size(10) * 2 + 4  # padx both sides + border fudge
+
         for idx, text in workspace_maps.items():
+            # Slightly over-estimate so we wrap a touch early rather than spill
+            # over the monitor edge.
+            lbl_width = ws_font.measure(text) + label_pad + gap * 2
+            if row_width > 0 and row_width + lbl_width > max_row_width:
+                row = tk.Frame(list_frame, bg=COLOR_BG)
+                row.pack(side="top", anchor="w")
+                row_width = 0
+
             lbl = tk.Label(
-                list_frame,
+                row,
                 text=text,
                 font=("Consolas", self.scaled_size(11), "bold"),
                 bg=self.workspace_surface_color,
                 fg=panel.name_colors.get(idx, self.workspace_font_color),
                 padx=self.scaled_size(10),
                 pady=self.scaled_size(6),
-                cursor="hand2" # Changes mouse cursor to hand pointer on hover
+                cursor="hand2"  # Changes mouse cursor to hand pointer on hover
             )
-            lbl.pack(side="left", padx=self.scaled_size(2))
-
+            lbl.pack(side="left", padx=gap)
             # Bind the mouse click event directly to Windows desktop switching API
             lbl.bind("<Button-1>", lambda event, num=idx: self.on_label_click(num))
             panel.label_widgets[idx] = lbl
             panel.label_base_text[idx] = text
+            row_width += lbl_width
 
         # Optional toolbar row populated by features declared in the config.
         self.build_toolbar(panel, config["features"])
@@ -1134,6 +1190,7 @@ class WorkspaceOverlay:
 
         toolbar = tk.Frame(panel.win, bg=COLOR_BG)
         toolbar.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
+        panel.toolbar_frame = toolbar
 
         if "movewindow" in features:
             panel.move_label = features["movewindow"]["label"]
@@ -1318,7 +1375,21 @@ class WorkspaceOverlay:
         # pixels next to the opaque entries makes the layered window re-composite
         # those transparent edges, which shows up as a ~1px diagonal "wiggle".
         frame = tk.Frame(panel.win, bg=COLOR_HIT_BG)
-        frame.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
+        # Pack into the correct slot directly. A plain side="top" pack appends
+        # to the BOTTOM of the stack, which on a rebuild would drop the grid
+        # below the timer box for a frame or two before anything corrected it,
+        # showing up as the shortcuts/timer visibly swapping places on a switch.
+        # Anchoring "before" the existing timer box keeps the order stable.
+        if (
+            panel.timer_frame is not None
+            and panel.timer_frame.winfo_exists()
+        ):
+            frame.pack(
+                side="top", anchor="w", pady=(self.scaled_size(4), 0),
+                before=panel.timer_frame,
+            )
+        else:
+            frame.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
         panel.shortcuts_frame = frame
 
         # Optional border drawn around the whole shortcut grid.
@@ -1332,21 +1403,15 @@ class WorkspaceOverlay:
             )
 
         column_count = shortcuts["column_count"]
-        for col in range(column_count):
-            frame.grid_columnconfigure(col, weight=1, uniform="shortcuts")
 
-        for index, entry in enumerate(visible_entries):
-            row = index // column_count
-            col = index % column_count
-
+        # Build every entry's item frame first WITHOUT gridding it, so the grid
+        # is never laid out at the (possibly oversized) configured column_count
+        # and then reflowed - that intermediate wide layout briefly painted as
+        # the component flashing very wide before snapping to its content size.
+        grid_items = []
+        for entry in visible_entries:
             item = tk.Frame(frame, bg=COLOR_HIT_BG, cursor="hand2")
-            item.grid(
-                row=row,
-                column=col,
-                sticky="we",
-                padx=self.scaled_size(2),
-                pady=self.scaled_size(2),
-            )
+            grid_items.append(item)
 
             entry_color = entry.get("color") or self.workspace_font_color
 
@@ -1384,6 +1449,43 @@ class WorkspaceOverlay:
                 widget.bind(
                     "<Button-1>", lambda event, en=entry: self.launch_shortcut(en)
                 )
+
+        # Clamp the column count so the grid never grows wider than the monitor.
+        # The columns are uniform width (= the widest entry) and every CONFIGURED
+        # column takes that width even when empty, so a column_count larger than
+        # the number of visible entries (or larger than the monitor can hold)
+        # pushes the grid past the monitor edge. An oversized layered
+        # -transparentcolor window fails to composite, which silently drops the
+        # rows above it (the toolbar vanishes), so cap the columns to what
+        # actually fits and let the entries wrap onto more rows.
+        effective_cols = min(column_count, len(grid_items))
+        if panel.monitor_rect and grid_items:
+            max_width = (
+                panel.monitor_rect[2] - panel.monitor_rect[0] - self.scaled_size(8)
+            )
+            # reqwidth is computed from each item's packed children even though
+            # the items are not yet gridded, so we can size columns up front.
+            frame.update_idletasks()
+            try:
+                col_w = max(it.winfo_reqwidth() for it in grid_items)
+            except ValueError:
+                col_w = 0
+            col_w += self.scaled_size(2) * 2  # grid padx on both sides
+            if col_w > 0:
+                effective_cols = min(effective_cols, max(1, int(max_width // col_w)))
+
+        effective_cols = max(1, effective_cols)
+        for col in range(effective_cols):
+            frame.grid_columnconfigure(col, weight=1, uniform="shortcuts")
+
+        for index, item in enumerate(grid_items):
+            item.grid(
+                row=index // effective_cols,
+                column=index % effective_cols,
+                sticky="we",
+                padx=self.scaled_size(2),
+                pady=self.scaled_size(2),
+            )
 
     def load_shortcut_icon(self, panel, icon_path):
         """Loads a shortcut icon image (PNG/GIF), or None to use a placeholder."""
@@ -1454,14 +1556,33 @@ class WorkspaceOverlay:
                 workspace = item.get("workspace")
                 if not isinstance(workspace, int):
                     workspace = None
+                # Whether the timer was paused when last saved, and the frozen
+                # remaining seconds to restore on resume.
+                paused = bool(item.get("paused", False))
+                remaining = item.get("remaining")
+                if not isinstance(remaining, (int, float)) or remaining < 0:
+                    remaining = max(0, end_epoch - time.time()) if paused else 0
+                # Original duration for the restart button; fall back to a best
+                # effort for legacy timers saved before this field existed.
+                duration = item.get("duration")
+                if not isinstance(duration, (int, float)) or duration <= 0:
+                    duration = (
+                        remaining if paused else max(0, end_epoch - time.time())
+                    ) or 0
                 timers.append(
                     {
                         "id": tid,
                         "name": name,
                         "end_epoch": float(end_epoch),
+                        # Original duration the restart button resets to.
+                        "duration": float(duration),
                         # Desktop number the timer was created on; only this
                         # workspace's label flashes when the timer expires.
                         "workspace": workspace,
+                        # Paused state plus the frozen remaining seconds, so a
+                        # paused timer keeps its countdown across restarts.
+                        "paused": paused,
+                        "remaining": float(remaining),
                         # Whether this timer's expiry has already triggered its
                         # flash, so it does not re-flash every poll or restart.
                         "notified": bool(item.get("notified", False)),
@@ -1509,7 +1630,13 @@ class WorkspaceOverlay:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
     def timer_remaining(self, timer):
-        """Whole seconds left on a timer (never negative)."""
+        """Whole seconds left on a timer (never negative).
+
+        A paused timer holds the remaining seconds captured when it was paused,
+        so its countdown freezes until it is resumed or restarted.
+        """
+        if timer.get("paused"):
+            return max(0, int(round(timer.get("remaining", 0))))
         return max(0, int(round(timer["end_epoch"] - time.time())))
 
     def rebuild_panel_timer(self, panel):
@@ -1664,6 +1791,42 @@ class WorkspaceOverlay:
         value_lbl.pack(side="left")
         panel.timer_value_labels[timer_entry["id"]] = value_lbl
 
+        # Pause/resume toggle: proper media pause icon while running, play icon
+        # while paused (drawn in the Segoe MDL2 Assets symbol font).
+        paused = bool(timer_entry.get("paused"))
+        pause_btn = tk.Label(
+            row,
+            text=f" {TIMER_RESUME_GLYPH if paused else TIMER_PAUSE_GLYPH} ",
+            font=(TIMER_ICON_FONT, self.scaled_size(10)),
+            bg=COLOR_HIT_BG,
+            fg=font_color,
+            padx=self.scaled_size(2),
+            pady=self.scaled_size(3),
+            cursor="hand2",
+        )
+        pause_btn.pack(side="left")
+        pause_btn.bind(
+            "<Button-1>",
+            lambda event, tid=timer_entry["id"]: self.toggle_pause_timer(tid),
+        )
+
+        # Restart: reset the timer back to its full original duration.
+        restart_btn = tk.Label(
+            row,
+            text=f" {TIMER_RESTART_GLYPH} ",
+            font=(TIMER_ICON_FONT, self.scaled_size(10)),
+            bg=COLOR_HIT_BG,
+            fg=font_color,
+            padx=self.scaled_size(2),
+            pady=self.scaled_size(3),
+            cursor="hand2",
+        )
+        restart_btn.pack(side="left")
+        restart_btn.bind(
+            "<Button-1>",
+            lambda event, tid=timer_entry["id"]: self.restart_timer(tid),
+        )
+
         remove_btn = tk.Label(
             row,
             text=f" {TIMER_REMOVE_GLYPH} ",
@@ -1793,6 +1956,9 @@ class WorkspaceOverlay:
             "id": self.next_timer_id,
             "name": name,
             "end_epoch": time.time() + seconds,
+            # Original duration in seconds, kept so the row's restart button can
+            # reset the timer back to its full length.
+            "duration": seconds,
             "workspace": self.last_active_desktop,
             "notified": False,
         }
@@ -1873,6 +2039,63 @@ class WorkspaceOverlay:
             if not self.timers:
                 self.stop_flashing()
             self.rebuild_timers()
+
+    def find_timer(self, timer_id):
+        """Returns the timer dict with the given id, or None."""
+        for timer in self.timers:
+            if timer["id"] == timer_id:
+                return timer
+        return None
+
+    def toggle_pause_timer(self, timer_id):
+        """Pauses a running timer or resumes a paused one.
+
+        Pausing freezes the remaining seconds; resuming pushes the end time out
+        so the countdown continues from where it left off. The row is rebuilt so
+        the button glyph flips between ⏸ and ▶.
+        """
+        timer = self.find_timer(timer_id)
+        if timer is None:
+            return
+        if timer.get("paused"):
+            # Resume: anchor a fresh end time to the frozen remaining seconds.
+            timer["end_epoch"] = time.time() + timer.get("remaining", 0)
+            timer["paused"] = False
+        else:
+            # Pause: capture the live remaining seconds and stop counting.
+            timer["remaining"] = self.timer_remaining(timer)
+            timer["paused"] = True
+        self.save_timers()
+        self.rebuild_timers()
+
+    def restart_timer(self, timer_id):
+        """Resets a timer to its full original duration and resumes counting."""
+        timer = self.find_timer(timer_id)
+        if timer is None:
+            return
+        duration = timer.get("duration", 0) or 0
+        timer["end_epoch"] = time.time() + duration
+        timer["remaining"] = duration
+        timer["paused"] = False
+        # A restarted timer is live again, so clear its expiry flash state.
+        timer["notified"] = False
+        workspace = timer.get("workspace")
+        if workspace in self.flashing_desktops and not any(
+            t.get("workspace") == workspace
+            and self.timer_remaining(t) <= 0
+            and t.get("notified")
+            for t in self.timers
+        ):
+            # No other expired timer keeps this workspace flashing; clear just
+            # this desktop and repaint its label back to normal.
+            self.flashing_desktops.discard(workspace)
+            for panel in self.panels:
+                if workspace in panel.label_widgets:
+                    self.style_label(panel, workspace)
+            if not self.flashing_desktops:
+                self.stop_flashing()
+        self.save_timers()
+        self.rebuild_timers()
 
     def prompt_clear_timers(self, panel):
         """Asks for confirmation, then removes all timers."""
@@ -2548,6 +2771,7 @@ class WorkspaceOverlay:
         for panel in self.panels:
             if current_desktop_num == panel.highlighted_desktop_num:
                 continue
+            previous_desktop_num = panel.highlighted_desktop_num
             panel.highlighted_desktop_num = current_desktop_num
             for idx in panel.label_widgets:
                 self.style_label(panel, idx)
@@ -2560,20 +2784,38 @@ class WorkspaceOverlay:
             # Rebuild the shortcut grid only when entries are scoped to specific
             # desktops, so the visible set tracks the active desktop. Runs on a
             # real switch, not per tick, so it does not trigger the "wiggle".
-            shortcuts_rebuilt = False
-            if (
-                panel.shortcuts_config is not None
-                and panel.shortcuts_config.get("has_workspace_filter")
-            ):
-                self.rebuild_panel_shortcuts(panel)
-                shortcuts_rebuilt = True
-            # Rebuild the timer box when it is desktop-scoped, or whenever the
-            # shortcut grid above it was just rebuilt (so the timer box, which
-            # packs last, stays below the shortcuts).
-            if panel.timer_config is not None and (
-                shortcuts_rebuilt or panel.timer_config.get("has_workspace_filter")
-            ):
-                self.rebuild_panel_timer(panel)
+            #
+            # The rebuild destroys the old grid before recreating it, so a
+            # transient failure midway would leave the grid gone. Roll the gate
+            # back on any error so the next tick retries instead of freezing the
+            # panel with no shortcuts until the config is resaved.
+            try:
+                if (
+                    panel.shortcuts_config is not None
+                    and panel.shortcuts_config.get("has_workspace_filter")
+                ):
+                    self.rebuild_panel_shortcuts(panel)
+                # Rebuild the timer box only when it is itself desktop-scoped.
+                # The shortcut grid repacks "before" the timer box (see
+                # build_shortcuts), so it no longer needs the timer rebuilt just
+                # to restore stacking order - rebuilding it here would only make
+                # the timer flicker on every switch.
+                if panel.timer_config is not None and panel.timer_config.get(
+                    "has_workspace_filter"
+                ):
+                    self.rebuild_panel_timer(panel)
+            except Exception:
+                panel.highlighted_desktop_num = previous_desktop_num
+                continue
+            # Rebuilding destroys and repacks the lower frames, which on the
+            # layered -transparentcolor window can leave the toolbar and box
+            # interiors un-painted (they flash, then a recomposite drops the
+            # child paints, leaving only frame borders). Flush Tk's pending
+            # geometry/redraw work synchronously so the whole panel repaints.
+            try:
+                panel.win.update_idletasks()
+            except Exception:
+                pass
 
     def poll_active_desktop(self):
         """Reads the current desktop number and repaints the highlight if moved.
@@ -2600,8 +2842,12 @@ class WorkspaceOverlay:
         needs to catch the rare cases that emit no activation (e.g. switching to
         an empty desktop). It therefore runs slowly to keep COM traffic low.
         """
-        self.poll_active_desktop()
-        self.root.after(150, self.track_desktop_loop)
+        try:
+            self.poll_active_desktop()
+        finally:
+            # Always re-arm, so a single failed tick never kills the poll and
+            # leaves desktop switches untracked until restart.
+            self.root.after(150, self.track_desktop_loop)
 
     def update_loop(self):
         next_delay = 400
@@ -2655,6 +2901,15 @@ class WorkspaceOverlay:
                     or current_config_mtime != self.config_mtime
                 ):
                     self.build_workspace_list()
+                    # A rebuild recreates each window through style_window(),
+                    # which unconditionally re-applies "-topmost True". If we
+                    # were already pinned to the background, re-assert background
+                    # mode so the freshly rebuilt windows drop behind other apps
+                    # again - otherwise a config save / monitor or desktop change
+                    # would silently leave the overlay stuck on top of every
+                    # window until the next foreground switch.
+                    if self.pin_to_background:
+                        self.enable_background_mode()
 
                 current_desktop_num = VirtualDesktop.current().number
 
