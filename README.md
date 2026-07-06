@@ -220,9 +220,11 @@ A toolbar can appear underneath the workspace list, populated by optional featur
 - `column_count` (integer `>= 1`) — how many columns to split the shortcut list across. Entries fill left-to-right, top-to-bottom.
 - `entries_color` (or `font_rgba`-style RGBA list / hex string) — optional default text/icon color applied to every shortcut. Individual entries can still override it.
 - `entries` — a list of shortcut objects. Each entry supports:
-  - `label` — the text shown on the shortcut (falls back to `path` if omitted).
-  - `path` — the program or file to open (required). Environment variables such as `%LOCALAPPDATA%` are expanded.
-  - `arguments` — optional command-line arguments passed when launching.
+  - `label` — the text shown on the shortcut (falls back to `path`, or the first command's `path`, if omitted).
+  - `path` — the program or file to open. Environment variables such as `%LOCALAPPDATA%` are expanded. Required unless you supply a `commands` list instead.
+  - `arguments` — optional command-line arguments passed when launching `path`.
+  - `commands` — optional list of `{ "path", "arguments" }` objects to launch **several** programs/files with a single click, run in order. When both `path` and `commands` are given, `path` runs first, then each command in the list. An entry needs at least one valid command (via `path` or `commands`) or it is skipped.
+  - `special_type` — optional `"cmd"`, `"powershell"`, or `"wsl"`. When set, the entry runs a batch of shell commands **sequentially in a single console window** (the window is kept open so you can see the output). In this form, `commands` is a list of plain command **strings** (not `{ path, arguments }` objects), and `path`/`arguments` are ignored. Use this for maintenance tasks like restarting a service or a set of related terminal commands.
   - `opt_icon` — optional path to a `PNG`/`GIF` icon. If omitted or it fails to load, a placeholder glyph is shown instead.
   - `color` (or `font_rgba`) — optional per-shortcut text/icon color, as a hex string such as `"#3399FF"` or an RGBA list (same format as the top-level `font_rgba`). Omit it to use `entries_color` if set, otherwise the shared label color.
   - `workspaces` — optional comma-separated string of 1-based virtual-desktop numbers (e.g. `"1,3,5"`). When set, the shortcut only appears while you are on one of those desktops. Omit it to show the shortcut on every desktop.
@@ -246,6 +248,23 @@ It also accepts two optional border properties that, when both are set, draw a b
         "path": "C:\\Windows\\explorer.exe",
         "arguments": "E:\\projects\\Desktop-Labeller",
         "opt_icon": "C:\\icons\\folder.png"
+      },
+      {
+        "label": "Morning setup",
+        "commands": [
+          { "path": "code", "arguments": "E:\\projects\\Desktop-Labeller" },
+          { "path": "chrome", "arguments": "--new-window \"https://mail.google.com\"" },
+          { "path": "chrome", "arguments": "--new-window \"https://calendar.google.com\"" }
+        ]
+      },
+      {
+        "label": "Restart WSL",
+        "special_type": "powershell",
+        "commands": [
+          "taskkill /f /im wsl.exe",
+          "taskkill /f /im wslservice.exe",
+          "Restart-Service WSLService"
+        ]
       }
     ]
   }

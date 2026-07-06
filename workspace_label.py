@@ -140,6 +140,7 @@ COLOR_TEXT_ACTIVE = "#FFB300" # Muted gold for the active workspace highlight
 COLOR_ACTIVE_BG = "#221100"   # Extremely dark brown highlight box background
 COLOR_BAD_CONFIG = "#FF3333"
 COLOR_BAD_BG = "#220000"
+SHORTCUT_SEPARATOR_COLOR = "#554422"  # Dim amber divider between shortcut entries
 
 
 def blend_hex(fg, bg, opacity):
@@ -761,15 +762,84 @@ class WorkspaceOverlay:
                 for item in raw_entries:
                     if not isinstance(item, dict):
                         continue
-                    path = item.get("path", "")
-                    if not isinstance(path, str) or not path.strip():
+                    # An entry may run its commands inside a SINGLE shell window
+                    # (one console, executed sequentially) when it declares a
+                    # "special_type" of "cmd", "powershell" or "wsl". In that
+                    # form "commands" is a list of plain command STRINGS. This
+                    # is separate from the default form below where "commands"
+                    # is a list of {"path", "arguments"} objects each launched
+                    # as its own program.
+                    special_type = item.get("special_type")
+                    if isinstance(special_type, str) and special_type.strip().lower() in (
+                        "cmd",
+                        "powershell",
+                        "wsl",
+                    ):
+                        special_type = special_type.strip().lower()
+                        raw_commands = item.get("commands")
+                        shell_commands = []
+                        if isinstance(raw_commands, list):
+                            for cmd in raw_commands:
+                                if isinstance(cmd, str) and cmd.strip():
+                                    shell_commands.append(cmd)
+                        if not shell_commands:
+                            continue
+                        label = item.get("label", "")
+                        if not isinstance(label, str) or not label.strip():
+                            label = shell_commands[0]
+                        icon = item.get("opt_icon")
+                        if not isinstance(icon, str) or not icon.strip():
+                            icon = None
+                        raw_color = item.get("font_rgba", item.get("color"))
+                        color = (
+                            self.parse_border_color(raw_color)
+                            if raw_color is not None
+                            else default_entry_color
+                        )
+                        workspaces = self.parse_workspaces(item.get("workspaces"))
+                        entries.append(
+                            {
+                                "label": label,
+                                "commands": [],
+                                "special_type": special_type,
+                                "shell_commands": shell_commands,
+                                "icon": icon,
+                                "color": color,
+                                "workspaces": workspaces,
+                            }
+                        )
+                        continue
+                    # An entry may launch a SINGLE program via top-level
+                    # "path"/"arguments", or MULTIPLE programs via a "commands"
+                    # list of {"path", "arguments"} objects run in order. When
+                    # both are present the top-level path runs first, then the
+                    # commands list. Normalize either form into a commands list.
+                    commands = []
+                    top_path = item.get("path", "")
+                    if isinstance(top_path, str) and top_path.strip():
+                        top_args = item.get("arguments", "")
+                        if not isinstance(top_args, str):
+                            top_args = ""
+                        commands.append({"path": top_path, "arguments": top_args})
+                    raw_commands = item.get("commands")
+                    if isinstance(raw_commands, list):
+                        for cmd in raw_commands:
+                            if not isinstance(cmd, dict):
+                                continue
+                            cmd_path = cmd.get("path", "")
+                            if not isinstance(cmd_path, str) or not cmd_path.strip():
+                                continue
+                            cmd_args = cmd.get("arguments", "")
+                            if not isinstance(cmd_args, str):
+                                cmd_args = ""
+                            commands.append(
+                                {"path": cmd_path, "arguments": cmd_args}
+                            )
+                    if not commands:
                         continue
                     label = item.get("label", "")
                     if not isinstance(label, str) or not label.strip():
-                        label = path
-                    arguments = item.get("arguments", "")
-                    if not isinstance(arguments, str):
-                        arguments = ""
+                        label = commands[0]["path"]
                     icon = item.get("opt_icon")
                     if not isinstance(icon, str) or not icon.strip():
                         icon = None
@@ -783,8 +853,9 @@ class WorkspaceOverlay:
                     entries.append(
                         {
                             "label": label,
-                            "path": path,
-                            "arguments": arguments,
+                            "commands": commands,
+                            "special_type": None,
+                            "shell_commands": [],
                             "icon": icon,
                             "color": color,
                             "workspaces": workspaces,
@@ -1352,13 +1423,15 @@ class WorkspaceOverlay:
         panel.shortcut_icons = []
         panel.shortcuts_config = shortcuts
 
-        # Drop a previously built grid (used when rebuilding on desktop change).
-        if panel.shortcuts_frame is not None:
-            try:
-                panel.shortcuts_frame.destroy()
-            except Exception:
-                pass
-            panel.shortcuts_frame = None
+        # Keep a reference to the currently displayed grid but DO NOT destroy it
+        # yet. We build the replacement fully (measured + gridded) while the old
+        # grid stays on screen, then swap atomically at the end. Destroying it
+        # up front - or packing an empty new frame and calling update_idletasks
+        # to measure - forces an intermediate paint where the grid is missing or
+        # zero-height, which showed up as the linkbar briefly rendering lower
+        # (the timer box jumping up to fill the gap, then back down).
+        old_frame = panel.shortcuts_frame
+        panel.shortcuts_frame = None
 
         current_desktop = self.last_active_desktop
         visible_entries = [
@@ -1368,29 +1441,22 @@ class WorkspaceOverlay:
             or (current_desktop is not None and current_desktop in entry["workspaces"])
         ]
         if not visible_entries:
+            if old_frame is not None:
+                try:
+                    old_frame.destroy()
+                except Exception:
+                    pass
             return
 
         # NOTE: the frame's background must be an opaque (non-keyed) color.
         # Using COLOR_BG (the -transparentcolor key) for the surrounding/gap
         # pixels next to the opaque entries makes the layered window re-composite
         # those transparent edges, which shows up as a ~1px diagonal "wiggle".
+        #
+        # Built UNPACKED (no geometry manager yet) so it stays invisible while
+        # we populate and measure it; it is packed into position only once it is
+        # fully laid out, so the user never sees a partially built grid.
         frame = tk.Frame(panel.win, bg=COLOR_HIT_BG)
-        # Pack into the correct slot directly. A plain side="top" pack appends
-        # to the BOTTOM of the stack, which on a rebuild would drop the grid
-        # below the timer box for a frame or two before anything corrected it,
-        # showing up as the shortcuts/timer visibly swapping places on a switch.
-        # Anchoring "before" the existing timer box keeps the order stable.
-        if (
-            panel.timer_frame is not None
-            and panel.timer_frame.winfo_exists()
-        ):
-            frame.pack(
-                side="top", anchor="w", pady=(self.scaled_size(4), 0),
-                before=panel.timer_frame,
-            )
-        else:
-            frame.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
-        panel.shortcuts_frame = frame
 
         # Optional border drawn around the whole shortcut grid.
         border_width = shortcuts.get("border_width", 0)
@@ -1420,7 +1486,7 @@ class WorkspaceOverlay:
                 item,
                 bg=COLOR_HIT_BG,
                 fg=entry_color,
-                padx=self.scaled_size(4),
+                padx=0,
                 pady=self.scaled_size(4),
                 cursor="hand2",
             )
@@ -1431,19 +1497,34 @@ class WorkspaceOverlay:
                     text=PLACEHOLDER_SHORTCUT_ICON,
                     font=("Segoe UI Emoji", self.scaled_size(11)),
                 )
-            icon_lbl.pack(side="left")
+            icon_lbl.pack(side="left", padx=(self.scaled_size(4), 0))
 
             text_lbl = tk.Label(
                 item,
-                text=f" {entry['label']} ",
+                text=f"{entry['label']} ",
                 font=("Segoe UI", self.scaled_size(11), "bold"),
                 bg=COLOR_HIT_BG,
                 fg=entry_color,
-                padx=self.scaled_size(4),
+                padx=0,
                 pady=self.scaled_size(4),
                 cursor="hand2",
             )
             text_lbl.pack(side="left")
+
+            # Thin vertical separator pinned to the right edge of the cell. The
+            # item stretches to the uniform column width (sticky="we"), so a
+            # side="right" separator lines up neatly between columns. It is
+            # hidden on the last item of each row after the grid is laid out.
+            separator = tk.Frame(
+                item,
+                bg=SHORTCUT_SEPARATOR_COLOR,
+                width=self.scaled_size(1),
+            )
+            separator.pack(
+                side="right", fill="y",
+                pady=self.scaled_size(3),
+            )
+            item.separator = separator
 
             for widget in (item, icon_lbl, text_lbl):
                 widget.bind(
@@ -1464,7 +1545,9 @@ class WorkspaceOverlay:
                 panel.monitor_rect[2] - panel.monitor_rect[0] - self.scaled_size(8)
             )
             # reqwidth is computed from each item's packed children even though
-            # the items are not yet gridded, so we can size columns up front.
+            # the items are not yet gridded and the frame is not yet packed, so
+            # we can size columns up front. The old grid is still on screen, so
+            # this measurement pass does not paint anything new.
             frame.update_idletasks()
             try:
                 col_w = max(it.winfo_reqwidth() for it in grid_items)
@@ -1486,6 +1569,33 @@ class WorkspaceOverlay:
                 padx=self.scaled_size(2),
                 pady=self.scaled_size(2),
             )
+            # Drop the separator on the last populated column of each row (and
+            # the very last entry) so the grid never ends with a trailing line.
+            is_row_end = (index % effective_cols) == effective_cols - 1
+            is_last = index == len(grid_items) - 1
+            if is_row_end or is_last:
+                item.separator.pack_forget()
+
+        # The replacement is fully laid out. Swap it in now: drop the old grid
+        # and pack the new one into the correct slot in a single step, with no
+        # update_idletasks afterwards, so the next natural paint shows only the
+        # finished grid already in its final place (no jump, no empty gap).
+        #
+        # A plain side="top" pack appends to the BOTTOM of the stack (below the
+        # timer box); anchoring "before" the timer keeps shortcuts above it.
+        if old_frame is not None:
+            try:
+                old_frame.destroy()
+            except Exception:
+                pass
+        if panel.timer_frame is not None and panel.timer_frame.winfo_exists():
+            frame.pack(
+                side="top", anchor="w", pady=(self.scaled_size(4), 0),
+                before=panel.timer_frame,
+            )
+        else:
+            frame.pack(side="top", anchor="w", pady=(self.scaled_size(4), 0))
+        panel.shortcuts_frame = frame
 
     def load_shortcut_icon(self, panel, icon_path):
         """Loads a shortcut icon image (PNG/GIF), or None to use a placeholder."""
@@ -1514,17 +1624,78 @@ class WorkspaceOverlay:
         return image
 
     def launch_shortcut(self, entry):
-        """Launches the program/file described by a shortcut config entry."""
-        path = os.path.expandvars(os.path.expanduser(entry["path"]))
-        arguments = os.path.expandvars(entry["arguments"]) if entry["arguments"] else ""
-        work_dir = os.path.dirname(path) if os.path.isfile(path) else None
+        """Launches everything described by a shortcut config entry.
+
+        Two forms are supported:
+
+        * A ``special_type`` entry ("cmd"/"powershell"/"wsl") runs its list of
+          command STRINGS sequentially inside a SINGLE console window.
+        * Otherwise the entry holds one or more {"path", "arguments"} commands
+          which are each launched as their own program, in order.
+        """
+        special_type = entry.get("special_type")
+        if special_type:
+            self.launch_special_commands(special_type, entry.get("shell_commands", []))
+            return
+
+        for command in entry.get("commands", []):
+            path = os.path.expandvars(os.path.expanduser(command["path"]))
+            arguments = (
+                os.path.expandvars(command["arguments"])
+                if command["arguments"]
+                else ""
+            )
+            work_dir = os.path.dirname(path) if os.path.isfile(path) else None
+            try:
+                win32api.ShellExecute(
+                    0,
+                    "open",
+                    path,
+                    arguments or None,
+                    work_dir,
+                    win32con.SW_SHOWNORMAL,
+                )
+            except Exception:
+                pass
+
+    def launch_special_commands(self, special_type, commands):
+        """Runs a list of command strings sequentially in one console window.
+
+        The commands are chained into a single interpreter invocation so they
+        share one window and execute one after another. The window is kept open
+        afterwards so the output stays visible.
+        """
+        commands = [
+            os.path.expandvars(cmd) for cmd in commands if isinstance(cmd, str) and cmd.strip()
+        ]
+        if not commands:
+            return
+
+        if special_type == "cmd":
+            # "&" chains commands sequentially regardless of individual failures;
+            # /k keeps the window open so the results remain visible.
+            path = "cmd.exe"
+            arguments = '/k "{}"'.format(" & ".join(commands))
+        elif special_type == "powershell":
+            # ";" separates statements; -NoExit keeps the console open.
+            path = "powershell.exe"
+            arguments = '-NoExit -Command "{}"'.format("; ".join(commands))
+        elif special_type == "wsl":
+            # Run inside a login shell, then hand control back to an interactive
+            # shell so the window stays open after the batch finishes.
+            joined = "; ".join(commands)
+            path = "wsl.exe"
+            arguments = '-e bash -lic "{}; exec bash"'.format(joined)
+        else:
+            return
+
         try:
             win32api.ShellExecute(
                 0,
                 "open",
                 path,
-                arguments or None,
-                work_dir,
+                arguments,
+                None,
                 win32con.SW_SHOWNORMAL,
             )
         except Exception:
